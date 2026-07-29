@@ -14,12 +14,15 @@ use windows::{
             Direct3D11::*,
             Dwm::DwmExtendFrameIntoClientArea,
             Dxgi::{Common::*, *},
+            Gdi::{CreateRoundRectRgn, SetWindowRgn},
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::MARGINS,
             HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
-            Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE},
+            Input::KeyboardAndMouse::{
+                MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, VK_ESCAPE,
+            },
             WindowsAndMessaging::*,
         },
     },
@@ -28,13 +31,11 @@ use windows::{
 
 const LENS_W: i32 = 420;
 const LENS_H: i32 = 280;
-const PAD: i32 = 24;
-const WIDTH: i32 = LENS_W + PAD * 2;
-const HEIGHT: i32 = LENS_H + PAD * 2;
 
 static mut DRAGGING: bool = false;
 static mut DRAG_CURSOR: POINT = POINT { x: 0, y: 0 };
-static mut DRAG_WINDOW: POINT = POINT { x: 0, y: 0 };
+static mut DRAG_LENS: POINT = POINT { x: 0, y: 0 };
+static mut LENS_POSITION: POINT = POINT { x: 420, y: 240 };
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -94,6 +95,8 @@ struct Renderer {
     desktop_texture: Option<ID3D11Texture2D>,
     desktop_view: Option<ID3D11ShaderResourceView>,
     output_rect: RECT,
+    width: i32,
+    height: i32,
 }
 
 fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<ID3DBlob> {
@@ -118,11 +121,11 @@ fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<
 }
 
 impl Renderer {
-    unsafe fn new(hwnd: HWND) -> Result<Self> {
+    unsafe fn new(hwnd: HWND, width: i32, height: i32) -> Result<Self> {
         let swap_desc = DXGI_SWAP_CHAIN_DESC {
             BufferDesc: DXGI_MODE_DESC {
-                Width: WIDTH as u32,
-                Height: HEIGHT as u32,
+                Width: width as u32,
+                Height: height as u32,
                 Format: DXGI_FORMAT_R8G8B8A8_UNORM,
                 RefreshRate: DXGI_RATIONAL {
                     Numerator: 60,
@@ -206,6 +209,8 @@ impl Renderer {
             desktop_texture: None,
             desktop_view: None,
             output_rect: RECT::default(),
+            width,
+            height,
         };
         renderer.create_duplication(hwnd)?;
         Ok(renderer)
@@ -331,9 +336,9 @@ impl Renderer {
                 (self.output_rect.bottom - self.output_rect.top) as f32,
             ],
             window_origin: [window.left as f32, window.top as f32],
-            window_size: [WIDTH as f32, HEIGHT as f32],
+            window_size: [self.width as f32, self.height as f32],
             lens_size: [LENS_W as f32, LENS_H as f32],
-            padding: [PAD as f32, PAD as f32],
+            padding: [LENS_POSITION.x as f32, LENS_POSITION.y as f32],
         };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         if self
@@ -354,8 +359,8 @@ impl Renderer {
             .OMSetRenderTargets(Some(&[Some(self.target.clone())]), None);
         self.context.ClearRenderTargetView(&self.target, &[0.0; 4]);
         self.context.RSSetViewports(Some(&[D3D11_VIEWPORT {
-            Width: WIDTH as f32,
-            Height: HEIGHT as f32,
+            Width: self.width as f32,
+            Height: self.height as f32,
             MaxDepth: 1.0,
             ..Default::default()
         }]));
@@ -375,33 +380,15 @@ impl Renderer {
     }
 }
 
-unsafe extern "system" fn window_proc(
+unsafe extern "system" fn overlay_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
-        WM_NCHITTEST => LRESULT(HTCLIENT as isize),
-        WM_LBUTTONDOWN => {
-            DRAGGING = true;
-            let _ = SetCapture(hwnd);
-            let _ = GetCursorPos(&mut DRAG_CURSOR);
-            let mut r = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut r);
-            DRAG_WINDOW = POINT {
-                x: r.left,
-                y: r.top,
-            };
-            LRESULT(0)
-        }
-        WM_MOUSEMOVE => LRESULT(0),
-        WM_LBUTTONUP => {
-            DRAGGING = false;
-            let _ = ReleaseCapture();
-            LRESULT(0)
-        }
-        WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
+        WM_HOTKEY => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
@@ -413,28 +400,53 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-unsafe fn update_drag(hwnd: HWND) {
-    if !DRAGGING {
-        return;
-    }
-    let mut cursor = POINT::default();
-    if GetCursorPos(&mut cursor).is_ok() {
-        let target_x = DRAG_WINDOW.x + cursor.x - DRAG_CURSOR.x;
-        let target_y = DRAG_WINDOW.y + cursor.y - DRAG_CURSOR.y;
-        let mut current = RECT::default();
-        if GetWindowRect(hwnd, &mut current).is_ok()
-            && (current.left != target_x || current.top != target_y)
-        {
-            let _ = SetWindowPos(
-                hwnd,
-                None,
-                target_x,
-                target_y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
+unsafe extern "system" fn input_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_LBUTTONDOWN => {
+            DRAGGING = true;
+            let _ = SetCapture(hwnd);
+            let _ = GetCursorPos(&mut DRAG_CURSOR);
+            DRAG_LENS = LENS_POSITION;
+            LRESULT(0)
         }
+        WM_MOUSEMOVE if DRAGGING => {
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_ok() {
+                let x = (DRAG_LENS.x + cursor.x - DRAG_CURSOR.x)
+                    .clamp(0, (GetSystemMetrics(SM_CXSCREEN) - LENS_W).max(0));
+                let y = (DRAG_LENS.y + cursor.y - DRAG_CURSOR.y)
+                    .clamp(0, (GetSystemMetrics(SM_CYSCREEN) - LENS_H).max(0));
+                if x != LENS_POSITION.x || y != LENS_POSITION.y {
+                    LENS_POSITION = POINT { x, y };
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        x,
+                        y,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            DRAGGING = false;
+            let _ = ReleaseCapture();
+            LRESULT(0)
+        }
+        WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => LRESULT(0),
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
@@ -443,23 +455,33 @@ fn main() -> Result<()> {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let module = GetModuleHandleW(None)?;
         let name = w!("RustLiquidGlassD3D11");
+        let input_name = w!("RustLiquidGlassInput");
         RegisterClassW(&WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
-            lpfnWndProc: Some(window_proc),
+            lpfnWndProc: Some(overlay_proc),
             hInstance: HINSTANCE(module.0),
             hCursor: LoadCursorW(None, IDC_HAND)?,
             lpszClassName: name,
             ..Default::default()
         });
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(input_proc),
+            hInstance: HINSTANCE(module.0),
+            hCursor: LoadCursorW(None, IDC_HAND)?,
+            lpszClassName: input_name,
+            ..Default::default()
+        });
+        let screen_width = GetSystemMetrics(SM_CXSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
         let hwnd = CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
             name,
             w!("Liquid Glass"),
             WS_POPUP | WS_VISIBLE,
-            420,
-            240,
-            WIDTH,
-            HEIGHT,
+            0,
+            0,
+            screen_width,
+            screen_height,
             None,
             None,
             Some(HINSTANCE(module.0)),
@@ -479,8 +501,33 @@ fn main() -> Result<()> {
         };
         DwmExtendFrameIntoClientArea(hwnd, &margins)?;
         SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)?;
-        let mut renderer = Renderer::new(hwnd)?;
+        RegisterHotKey(Some(hwnd), 1, MOD_NOREPEAT, VK_ESCAPE.0 as u32)?;
+        let input_hwnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            input_name,
+            w!("Liquid Glass Input"),
+            WS_POPUP | WS_VISIBLE,
+            LENS_POSITION.x,
+            LENS_POSITION.y,
+            LENS_W,
+            LENS_H,
+            None,
+            None,
+            Some(HINSTANCE(module.0)),
+            None,
+        )?;
+        SetLayeredWindowAttributes(
+            input_hwnd,
+            windows::Win32::Foundation::COLORREF(0),
+            1,
+            LWA_ALPHA,
+        )?;
+        let input_region = CreateRoundRectRgn(0, 0, LENS_W + 1, LENS_H + 1, LENS_H, LENS_H);
+        SetWindowRgn(input_hwnd, Some(input_region), true);
+        SetWindowDisplayAffinity(input_hwnd, WDA_EXCLUDEFROMCAPTURE)?;
+        let mut renderer = Renderer::new(hwnd, screen_width, screen_height)?;
         let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(input_hwnd, SW_SHOW);
         let mut msg = MSG::default();
         loop {
             let mut handled = 0;
@@ -492,7 +539,6 @@ fn main() -> Result<()> {
                 DispatchMessageW(&msg);
                 handled += 1;
             }
-            update_drag(hwnd);
             renderer.render(hwnd);
         }
     }
