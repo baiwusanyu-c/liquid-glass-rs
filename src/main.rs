@@ -29,8 +29,40 @@ use windows::{
     core::{Interface, Result, s, w},
 };
 
+// Lens window size in physical pixels.
 const LENS_W: i32 = 420;
 const LENS_H: i32 = 280;
+
+// Shadow: vertical offset and softness are in physical pixels.
+const SHADOW_OFFSET_Y: f32 = 7.0;
+const SHADOW_SOFTNESS: f32 = 9.0;
+const SHADOW_OPACITY: f32 = 0.28;
+
+// Refraction: smaller core values or a larger bias strengthen edge distortion.
+const REFRACTION_CORE_X: f32 = 0.30;
+const REFRACTION_CORE_Y: f32 = 0.20;
+const REFRACTION_RADIUS: f32 = 0.60;
+const REFRACTION_TRANSITION: f32 = 0.80;
+const REFRACTION_BIAS: f32 = 0.15;
+
+// Edge effect width and RGB channel separation, in physical pixels.
+const EDGE_EFFECT_WIDTH: f32 = 24.0;
+const CHROMATIC_OFFSET: f32 = 0.80;
+
+// Color: contrast around 0.5, followed by gain and additive lift.
+const COLOR_CONTRAST: f32 = 1.04;
+const COLOR_GAIN: f32 = 1.025;
+const COLOR_LIFT: f32 = 0.018;
+
+// Directional edge lighting.
+const TOP_LIGHT_POSITION: f32 = 0.50;
+const TOP_LIGHT_STRENGTH: f32 = 0.07;
+const LOWER_SHADOW_POSITION: f32 = 0.34;
+const LOWER_SHADOW_STRENGTH: f32 = 0.08;
+
+// Outline anti-aliasing. Increase both slightly for a softer edge.
+const AA_DERIVATIVE_SCALE: f32 = 0.75;
+const AA_MIN_HALF_WIDTH: f32 = 0.75;
 
 static mut DRAGGING: bool = false;
 static mut DRAG_CURSOR: POINT = POINT { x: 0, y: 0 };
@@ -46,40 +78,43 @@ struct Constants {
     window_size: [f32; 2],
     lens_size: [f32; 2],
     padding: [f32; 2],
+    shadow_settings: [f32; 4],
+    refraction_settings: [f32; 4],
+    effects_settings: [f32; 4],
+    color_settings: [f32; 4],
+    detail_settings: [f32; 4],
 }
 
 const SHADER: &str = r#"
-cbuffer C : register(b0) { float2 outputOrigin, outputSize, windowOrigin, windowSize, lensSize, padding; };
+cbuffer C : register(b0) {
+ float2 outputOrigin, outputSize, windowOrigin, windowSize, lensSize, padding;
+ float4 shadowSettings, refractionSettings, effectsSettings, colorSettings, detailSettings;
+};
 Texture2D desktop : register(t0); SamplerState samp : register(s0);
 struct V { float4 pos:SV_POSITION; float2 uv:TEXCOORD0; };
 V VSMain(uint id:SV_VertexID) { V o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.pos=float4(p*float2(2,-2)+float2(-1,1),0,1); return o; }
 float sdf(float2 p,float2 halfSize,float radius) { float2 q=abs(p)-halfSize+radius; return min(max(q.x,q.y),0)+length(max(q,0))-radius; }
-float3 blur9(float2 uv,float2 t,float r) {
- float3 c=desktop.Sample(samp,uv).rgb*.24;
- c+=(desktop.Sample(samp,uv+t*float2(r,0)).rgb+desktop.Sample(samp,uv-t*float2(r,0)).rgb+desktop.Sample(samp,uv+t*float2(0,r)).rgb+desktop.Sample(samp,uv-t*float2(0,r)).rgb)*.12;
- c+=(desktop.Sample(samp,uv+t*float2(r,r)).rgb+desktop.Sample(samp,uv+t*float2(-r,r)).rgb+desktop.Sample(samp,uv+t*float2(r,-r)).rgb+desktop.Sample(samp,uv-t*float2(r,r)).rgb)*.07; return c;
-}
 float4 PSMain(V i):SV_TARGET {
  float2 px=i.uv*windowSize, local=px-padding, p=local-lensSize*.5; float radius=lensSize.y*.5;
- float d=sdf(p,lensSize*.5,radius); float sd=sdf(p-float2(0,7),lensSize*.5,radius);
- float shadow=exp(-pow(max(sd,0)/9,2))*.28;
+ float d=sdf(p,lensSize*.5,radius); float sd=sdf(p-float2(0,shadowSettings.x),lensSize*.5,radius);
+ float shadow=exp(-pow(max(sd,0)/shadowSettings.y,2))*shadowSettings.z;
  float2 uv=local/lensSize, center=uv-.5;
- float mapDistance=sdf(center,float2(.3,.2),.6);
- float displacement=smoothstep(.8,0,mapDistance-.15);
+ float mapDistance=sdf(center,refractionSettings.xy,refractionSettings.z);
+ float displacement=smoothstep(refractionSettings.w,0,mapDistance-effectsSettings.x);
  float scaled=smoothstep(0,1,displacement);
  float2 source=(center*scaled+.5)*lensSize;
  float2 screenUv=(windowOrigin+padding+source-outputOrigin)/outputSize, texel=1/outputSize;
- float edge=saturate(1-smoothstep(0,24,-d));
+ float edge=saturate(1-smoothstep(0,effectsSettings.y,-d));
  float2 radial=normalize(center+float2(.0001,.0001));
  float3 col=desktop.Sample(samp,screenUv).rgb;
- float chroma=edge*edge*.8;
+ float chroma=edge*edge*effectsSettings.z;
  col.r=desktop.Sample(samp,screenUv+radial*texel*chroma).r;
  col.b=desktop.Sample(samp,screenUv-radial*texel*chroma).b;
- col=saturate((col-.5)*1.04+.5); col=saturate(col*1.025+.018);
- float topLight=edge*saturate(.5-uv.y)*.07;
- float lowerShadow=edge*saturate(uv.y-.34)*.08;
+ col=saturate((col-.5)*effectsSettings.w+.5); col=saturate(col*colorSettings.x+colorSettings.y);
+ float topLight=edge*saturate(colorSettings.z-uv.y)*colorSettings.w;
+ float lowerShadow=edge*saturate(uv.y-detailSettings.x)*detailSettings.y;
  col=saturate(col+topLight-lowerShadow);
- float aa=max(fwidth(d)*.75,.75);
+ float aa=max(fwidth(d)*detailSettings.z,detailSettings.w);
  float glassAlpha=smoothstep(aa,-aa,d);
  float alpha=glassAlpha+shadow*(1-glassAlpha);
  return float4(col*glassAlpha,alpha);
@@ -359,6 +394,31 @@ impl Renderer {
             padding: [
                 (LENS_POSITION.x - window.left) as f32,
                 (LENS_POSITION.y - window.top) as f32,
+            ],
+            shadow_settings: [SHADOW_OFFSET_Y, SHADOW_SOFTNESS, SHADOW_OPACITY, 0.0],
+            refraction_settings: [
+                REFRACTION_CORE_X,
+                REFRACTION_CORE_Y,
+                REFRACTION_RADIUS,
+                REFRACTION_TRANSITION,
+            ],
+            effects_settings: [
+                REFRACTION_BIAS,
+                EDGE_EFFECT_WIDTH,
+                CHROMATIC_OFFSET,
+                COLOR_CONTRAST,
+            ],
+            color_settings: [
+                COLOR_GAIN,
+                COLOR_LIFT,
+                TOP_LIGHT_POSITION,
+                TOP_LIGHT_STRENGTH,
+            ],
+            detail_settings: [
+                LOWER_SHADOW_POSITION,
+                LOWER_SHADOW_STRENGTH,
+                AA_DERIVATIVE_SCALE,
+                AA_MIN_HALF_WIDTH,
             ],
         };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
