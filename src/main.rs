@@ -79,7 +79,8 @@ float4 PSMain(V i):SV_TARGET {
  float topLight=edge*saturate(.5-uv.y)*.07;
  float lowerShadow=edge*saturate(uv.y-.34)*.08;
  col=saturate(col+topLight-lowerShadow);
- float a=smoothstep(1.5,-1,d); return float4(col*a,a);
+ float aa=max(fwidth(d)*.5,.5);
+ float a=smoothstep(aa,-aa,d); return float4(col*a,a);
 }"#;
 
 struct Renderer {
@@ -212,36 +213,31 @@ impl Renderer {
             width,
             height,
         };
-        renderer.create_duplication(hwnd)?;
+        renderer.create_duplication(POINT {
+            x: LENS_POSITION.x + LENS_W / 2,
+            y: LENS_POSITION.y + LENS_H / 2,
+        })?;
         Ok(renderer)
     }
 
-    unsafe fn create_duplication(&mut self, hwnd: HWND) -> Result<()> {
+    unsafe fn create_duplication(&mut self, point: POINT) -> Result<()> {
         let dxgi: IDXGIDevice = self.device.cast()?;
         let adapter = dxgi.GetAdapter()?;
-        let mut window = RECT::default();
-        GetWindowRect(hwnd, &mut window)?;
-        let center = POINT {
-            x: (window.left + window.right) / 2,
-            y: (window.top + window.bottom) / 2,
-        };
         let mut selected = None;
+        let mut selected_rect = RECT::default();
         let mut index = 0;
         while let Ok(output) = adapter.EnumOutputs(index) {
             let desc = output.GetDesc()?;
             let r = desc.DesktopCoordinates;
             if selected.is_none()
-                || (center.x >= r.left
-                    && center.x < r.right
-                    && center.y >= r.top
-                    && center.y < r.bottom)
+                || (point.x >= r.left
+                    && point.x < r.right
+                    && point.y >= r.top
+                    && point.y < r.bottom)
             {
-                self.output_rect = r;
+                selected_rect = r;
                 selected = Some(output);
-                if center.x >= r.left
-                    && center.x < r.right
-                    && center.y >= r.top
-                    && center.y < r.bottom
+                if point.x >= r.left && point.x < r.right && point.y >= r.top && point.y < r.bottom
                 {
                     break;
                 }
@@ -251,8 +247,27 @@ impl Renderer {
         let output1: IDXGIOutput1 = selected
             .ok_or_else(windows::core::Error::from_thread)?
             .cast()?;
-        self.duplication = Some(output1.DuplicateOutput(&self.device)?);
+        self.duplication = None;
+        let duplication = output1.DuplicateOutput(&self.device)?;
+        self.output_rect = selected_rect;
+        self.desktop_view = None;
+        self.desktop_texture = None;
+        self.duplication = Some(duplication);
         Ok(())
+    }
+
+    unsafe fn select_lens_output(&mut self) {
+        let center = POINT {
+            x: LENS_POSITION.x + LENS_W / 2,
+            y: LENS_POSITION.y + LENS_H / 2,
+        };
+        if center.x < self.output_rect.left
+            || center.x >= self.output_rect.right
+            || center.y < self.output_rect.top
+            || center.y >= self.output_rect.bottom
+        {
+            let _ = self.create_duplication(center);
+        }
     }
 
     unsafe fn capture(&mut self) {
@@ -321,6 +336,7 @@ impl Renderer {
     }
 
     unsafe fn render(&mut self, hwnd: HWND) {
+        self.select_lens_output();
         self.capture();
         let Some(view) = self.desktop_view.clone() else {
             return;
@@ -338,7 +354,10 @@ impl Renderer {
             window_origin: [window.left as f32, window.top as f32],
             window_size: [self.width as f32, self.height as f32],
             lens_size: [LENS_W as f32, LENS_H as f32],
-            padding: [LENS_POSITION.x as f32, LENS_POSITION.y as f32],
+            padding: [
+                (LENS_POSITION.x - window.left) as f32,
+                (LENS_POSITION.y - window.top) as f32,
+            ],
         };
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
         if self
@@ -417,10 +436,14 @@ unsafe extern "system" fn input_proc(
         WM_MOUSEMOVE if DRAGGING => {
             let mut cursor = POINT::default();
             if GetCursorPos(&mut cursor).is_ok() {
+                let virtual_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                let virtual_right = virtual_left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                let virtual_bottom = virtual_top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
                 let x = (DRAG_LENS.x + cursor.x - DRAG_CURSOR.x)
-                    .clamp(0, (GetSystemMetrics(SM_CXSCREEN) - LENS_W).max(0));
+                    .clamp(virtual_left, (virtual_right - LENS_W).max(virtual_left));
                 let y = (DRAG_LENS.y + cursor.y - DRAG_CURSOR.y)
-                    .clamp(0, (GetSystemMetrics(SM_CYSCREEN) - LENS_H).max(0));
+                    .clamp(virtual_top, (virtual_bottom - LENS_H).max(virtual_top));
                 if x != LENS_POSITION.x || y != LENS_POSITION.y {
                     LENS_POSITION = POINT { x, y };
                     let _ = SetWindowPos(
@@ -471,15 +494,17 @@ fn main() -> Result<()> {
             lpszClassName: input_name,
             ..Default::default()
         });
-        let screen_width = GetSystemMetrics(SM_CXSCREEN);
-        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+        let screen_left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let screen_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let screen_width = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let screen_height = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT,
             name,
             w!("Liquid Glass"),
             WS_POPUP | WS_VISIBLE,
-            0,
-            0,
+            screen_left,
+            screen_top,
             screen_width,
             screen_height,
             None,
