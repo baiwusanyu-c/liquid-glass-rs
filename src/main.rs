@@ -62,7 +62,7 @@ float3 blur9(float2 uv,float2 t,float r) {
 float4 PSMain(V i):SV_TARGET {
  float2 px=i.uv*windowSize, local=px-padding, p=local-lensSize*.5; float radius=lensSize.y*.5;
  float d=sdf(p,lensSize*.5,radius); float sd=sdf(p-float2(0,7),lensSize*.5,radius);
- float shadow=exp(-pow(max(sd,0)/9,2))*.28; if(d>1.5) return float4(0,0,0,shadow);
+ float shadow=exp(-pow(max(sd,0)/9,2))*.28;
  float2 uv=local/lensSize, center=uv-.5;
  float mapDistance=sdf(center,float2(.3,.2),.6);
  float displacement=smoothstep(.8,0,mapDistance-.15);
@@ -79,8 +79,10 @@ float4 PSMain(V i):SV_TARGET {
  float topLight=edge*saturate(.5-uv.y)*.07;
  float lowerShadow=edge*saturate(uv.y-.34)*.08;
  col=saturate(col+topLight-lowerShadow);
- float aa=max(fwidth(d)*.5,.5);
- float a=smoothstep(aa,-aa,d); return float4(col*a,a);
+ float aa=max(fwidth(d)*.75,.75);
+ float glassAlpha=smoothstep(aa,-aa,d);
+ float alpha=glassAlpha+shadow*(1-glassAlpha);
+ return float4(col*glassAlpha,alpha);
 }"#;
 
 struct Renderer {
