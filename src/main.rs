@@ -12,7 +12,7 @@ use windows::{
                 ID3DBlob,
             },
             Direct3D11::*,
-            Dwm::{DwmExtendFrameIntoClientArea, DwmFlush},
+            Dwm::DwmExtendFrameIntoClientArea,
             Dxgi::{Common::*, *},
         },
         System::LibraryLoader::GetModuleHandleW,
@@ -63,18 +63,21 @@ float4 PSMain(V i):SV_TARGET {
  float d=sdf(p,lensSize*.5,radius); float sd=sdf(p-float2(0,7),lensSize*.5,radius);
  float shadow=exp(-pow(max(sd,0)/9,2))*.28; if(d>1.5) return float4(0,0,0,shadow);
  float2 uv=local/lensSize, center=uv-.5;
- float e=1.5; float2 normal=normalize(float2(sdf(p+float2(e,0),lensSize*.5,radius)-sdf(p-float2(e,0),lensSize*.5,radius),sdf(p+float2(0,e),lensSize*.5,radius)-sdf(p-float2(0,e),lensSize*.5,radius))+.00001);
- float edge=saturate(1-smoothstep(0,42,-d)); float er=edge*edge; er=er*er*(3-2*er);
- float2 refractPx=normal*er*18.0; float2 lens=center*(.03*(1-edge*edge))*lensSize;
- float2 source=local+refractPx-lens;
+ float mapDistance=sdf(center,float2(.3,.2),.6);
+ float displacement=smoothstep(.8,0,mapDistance-.15);
+ float scaled=smoothstep(0,1,displacement);
+ float2 source=(center*scaled+.5)*lensSize;
  float2 screenUv=(windowOrigin+padding+source-outputOrigin)/outputSize, texel=1/outputSize;
- float3 sharp=desktop.Sample(samp,screenUv).rgb; float3 soft=blur9(screenUv,texel,lerp(.15,.75,edge));
- float3 col=lerp(sharp,soft,edge*.42);
- float chroma=er*1.15; col.r=lerp(col.r,desktop.Sample(samp,screenUv+normal*texel*chroma).r,edge*.42); col.b=lerp(col.b,desktop.Sample(samp,screenUv-normal*texel*chroma).b,edge*.42);
+ float edge=saturate(1-smoothstep(0,24,-d));
+ float2 radial=normalize(center+float2(.0001,.0001));
+ float3 col=desktop.Sample(samp,screenUv).rgb;
+ float chroma=edge*edge*.8;
+ col.r=desktop.Sample(samp,screenUv+radial*texel*chroma).r;
+ col.b=desktop.Sample(samp,screenUv-radial*texel*chroma).b;
  col=saturate((col-.5)*1.04+.5); col=saturate(col*1.025+.018);
- float2 light=normalize(float2(-.55,-.84)); float facing=dot(normal,light);
- float highlight=pow(saturate(facing),3)*edge*.13; float innerShadow=pow(saturate(-facing),2)*edge*.075;
- col=saturate(col+highlight-innerShadow);
+ float topLight=edge*saturate(.5-uv.y)*.07;
+ float lowerShadow=edge*saturate(uv.y-.34)*.08;
+ col=saturate(col+topLight-lowerShadow);
  float a=smoothstep(1.5,-1,d); return float4(col*a,a);
 }"#;
 
@@ -416,16 +419,22 @@ unsafe fn update_drag(hwnd: HWND) {
     }
     let mut cursor = POINT::default();
     if GetCursorPos(&mut cursor).is_ok() {
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            DRAG_WINDOW.x + cursor.x - DRAG_CURSOR.x,
-            DRAG_WINDOW.y + cursor.y - DRAG_CURSOR.y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        );
-        let _ = DwmFlush();
+        let target_x = DRAG_WINDOW.x + cursor.x - DRAG_CURSOR.x;
+        let target_y = DRAG_WINDOW.y + cursor.y - DRAG_CURSOR.y;
+        let mut current = RECT::default();
+        if GetWindowRect(hwnd, &mut current).is_ok()
+            && (current.left != target_x || current.top != target_y)
+        {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                target_x,
+                target_y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
     }
 }
 
