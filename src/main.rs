@@ -19,7 +19,10 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::MARGINS,
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+            HiDpi::{
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow,
+                SetProcessDpiAwarenessContext,
+            },
             Input::KeyboardAndMouse::{
                 MOD_NOREPEAT, RegisterHotKey, ReleaseCapture, SetCapture, VK_ESCAPE,
             },
@@ -29,7 +32,7 @@ use windows::{
     core::{Interface, Result, s, w},
 };
 
-// Lens window size in physical pixels.
+// Lens size in logical pixels at 96 DPI.
 const LENS_W: i32 = 420;
 const LENS_H: i32 = 280;
 
@@ -68,6 +71,19 @@ static mut DRAGGING: bool = false;
 static mut DRAG_CURSOR: POINT = POINT { x: 0, y: 0 };
 static mut DRAG_LENS: POINT = POINT { x: 0, y: 0 };
 static mut LENS_POSITION: POINT = POINT { x: 420, y: 240 };
+static mut LENS_SIZE: POINT = POINT {
+    x: LENS_W,
+    y: LENS_H,
+};
+static mut LENS_DPI: u32 = 96;
+
+fn scale_for_dpi(value: i32, dpi: u32) -> i32 {
+    ((value as i64 * dpi as i64 + 48) / 96) as i32
+}
+
+fn scale_effect_for_dpi(value: f32, dpi: u32) -> f32 {
+    value * dpi as f32 / 96.0
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -394,12 +410,17 @@ impl Renderer {
                 ],
                 window_origin: [window.left as f32, window.top as f32],
                 window_size: [self.width as f32, self.height as f32],
-                lens_size: [LENS_W as f32, LENS_H as f32],
+                lens_size: [LENS_SIZE.x as f32, LENS_SIZE.y as f32],
                 padding: [
                     (LENS_POSITION.x - window.left) as f32,
                     (LENS_POSITION.y - window.top) as f32,
                 ],
-                shadow_settings: [SHADOW_OFFSET_Y, SHADOW_SOFTNESS, SHADOW_OPACITY, 0.0],
+                shadow_settings: [
+                    scale_effect_for_dpi(SHADOW_OFFSET_Y, LENS_DPI),
+                    scale_effect_for_dpi(SHADOW_SOFTNESS, LENS_DPI),
+                    SHADOW_OPACITY,
+                    0.0,
+                ],
                 refraction_settings: [
                     REFRACTION_CORE_X,
                     REFRACTION_CORE_Y,
@@ -408,8 +429,8 @@ impl Renderer {
                 ],
                 effects_settings: [
                     REFRACTION_BIAS,
-                    EDGE_EFFECT_WIDTH,
-                    CHROMATIC_OFFSET,
+                    scale_effect_for_dpi(EDGE_EFFECT_WIDTH, LENS_DPI),
+                    scale_effect_for_dpi(CHROMATIC_OFFSET, LENS_DPI),
                     COLOR_CONTRAST,
                 ],
                 color_settings: [
@@ -422,7 +443,7 @@ impl Renderer {
                     LOWER_SHADOW_POSITION,
                     LOWER_SHADOW_STRENGTH,
                     AA_DERIVATIVE_SCALE,
-                    AA_MIN_HALF_WIDTH,
+                    scale_effect_for_dpi(AA_MIN_HALF_WIDTH, LENS_DPI),
                 ],
             };
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -496,10 +517,12 @@ unsafe extern "system" fn input_proc(
                 let virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
                 let virtual_right = virtual_left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
                 let virtual_bottom = virtual_top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
-                let x = (DRAG_LENS.x + cursor.x - DRAG_CURSOR.x)
-                    .clamp(virtual_left, (virtual_right - LENS_W).max(virtual_left));
+                let x = (DRAG_LENS.x + cursor.x - DRAG_CURSOR.x).clamp(
+                    virtual_left,
+                    (virtual_right - LENS_SIZE.x).max(virtual_left),
+                );
                 let y = (DRAG_LENS.y + cursor.y - DRAG_CURSOR.y)
-                    .clamp(virtual_top, (virtual_bottom - LENS_H).max(virtual_top));
+                    .clamp(virtual_top, (virtual_bottom - LENS_SIZE.y).max(virtual_top));
                 if x != LENS_POSITION.x || y != LENS_POSITION.y {
                     LENS_POSITION = POINT { x, y };
                     let _ = SetWindowPos(
@@ -520,6 +543,42 @@ unsafe extern "system" fn input_proc(
             let _ = ReleaseCapture();
             LRESULT(0)
         }
+        WM_DPICHANGED => {
+            let new_dpi = (wparam.0 & 0xffff) as u32;
+            if new_dpi != 0 && new_dpi != LENS_DPI {
+                let old_size = LENS_SIZE;
+                LENS_DPI = new_dpi;
+                LENS_SIZE = POINT {
+                    x: scale_for_dpi(LENS_W, new_dpi),
+                    y: scale_for_dpi(LENS_H, new_dpi),
+                };
+                LENS_POSITION.x += (old_size.x - LENS_SIZE.x) / 2;
+                LENS_POSITION.y += (old_size.y - LENS_SIZE.y) / 2;
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    LENS_POSITION.x,
+                    LENS_POSITION.y,
+                    LENS_SIZE.x,
+                    LENS_SIZE.y,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                let region = CreateRoundRectRgn(
+                    0,
+                    0,
+                    LENS_SIZE.x + 1,
+                    LENS_SIZE.y + 1,
+                    LENS_SIZE.y,
+                    LENS_SIZE.y,
+                );
+                let _ = SetWindowRgn(hwnd, Some(region), true);
+                if DRAGGING {
+                    DRAG_LENS = LENS_POSITION;
+                    let _ = GetCursorPos(&mut DRAG_CURSOR);
+                }
+            }
+            LRESULT(0)
+        }
         WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -531,7 +590,7 @@ unsafe extern "system" fn input_proc(
 
 fn main() -> Result<()> {
     unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
         let module = GetModuleHandleW(None)?;
         let name = w!("RustLiquidGlassD3D11");
         let input_name = w!("RustLiquidGlassInput");
@@ -597,13 +656,34 @@ fn main() -> Result<()> {
             Some(HINSTANCE(module.0)),
             None,
         )?;
+        LENS_DPI = GetDpiForWindow(input_hwnd);
+        LENS_SIZE = POINT {
+            x: scale_for_dpi(LENS_W, LENS_DPI),
+            y: scale_for_dpi(LENS_H, LENS_DPI),
+        };
+        let _ = SetWindowPos(
+            input_hwnd,
+            None,
+            LENS_POSITION.x,
+            LENS_POSITION.y,
+            LENS_SIZE.x,
+            LENS_SIZE.y,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
         SetLayeredWindowAttributes(
             input_hwnd,
             windows::Win32::Foundation::COLORREF(0),
             1,
             LWA_ALPHA,
         )?;
-        let input_region = CreateRoundRectRgn(0, 0, LENS_W + 1, LENS_H + 1, LENS_H, LENS_H);
+        let input_region = CreateRoundRectRgn(
+            0,
+            0,
+            LENS_SIZE.x + 1,
+            LENS_SIZE.y + 1,
+            LENS_SIZE.y,
+            LENS_SIZE.y,
+        );
         SetWindowRgn(input_hwnd, Some(input_region), true);
         SetWindowDisplayAffinity(input_hwnd, WDA_EXCLUDEFROMCAPTURE)?;
         let mut renderer = Renderer::new(hwnd, screen_width, screen_height)?;
