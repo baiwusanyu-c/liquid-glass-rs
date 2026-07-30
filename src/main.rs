@@ -129,12 +129,17 @@ struct Renderer {
     pixel_shader: ID3D11PixelShader,
     constants: ID3D11Buffer,
     sampler: ID3D11SamplerState,
-    duplication: Option<IDXGIOutputDuplication>,
-    desktop_texture: Option<ID3D11Texture2D>,
-    desktop_view: Option<ID3D11ShaderResourceView>,
-    output_rect: RECT,
+    rasterizer: ID3D11RasterizerState,
+    outputs: Vec<OutputCapture>,
     width: i32,
     height: i32,
+}
+
+struct OutputCapture {
+    duplication: IDXGIOutputDuplication,
+    desktop_texture: Option<ID3D11Texture2D>,
+    desktop_view: Option<ID3D11ShaderResourceView>,
+    rect: RECT,
 }
 
 fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<ID3DBlob> {
@@ -234,6 +239,17 @@ impl Renderer {
         };
         let mut sampler = None;
         device.CreateSamplerState(&sampler_desc, Some(&mut sampler))?;
+        let mut rasterizer = None;
+        device.CreateRasterizerState(
+            &D3D11_RASTERIZER_DESC {
+                FillMode: D3D11_FILL_SOLID,
+                CullMode: D3D11_CULL_NONE,
+                ScissorEnable: true.into(),
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            Some(&mut rasterizer),
+        )?;
         let mut renderer = Self {
             device,
             context,
@@ -243,79 +259,48 @@ impl Renderer {
             pixel_shader: pixel_shader.unwrap(),
             constants: constants.unwrap(),
             sampler: sampler.unwrap(),
-            duplication: None,
-            desktop_texture: None,
-            desktop_view: None,
-            output_rect: RECT::default(),
+            rasterizer: rasterizer.unwrap(),
+            outputs: Vec::new(),
             width,
             height,
         };
-        renderer.create_duplication(POINT {
-            x: LENS_POSITION.x + LENS_W / 2,
-            y: LENS_POSITION.y + LENS_H / 2,
-        })?;
+        renderer.create_duplications()?;
         Ok(renderer)
     }
 
-    unsafe fn create_duplication(&mut self, point: POINT) -> Result<()> {
+    unsafe fn create_duplications(&mut self) -> Result<()> {
         let dxgi: IDXGIDevice = self.device.cast()?;
         let adapter = dxgi.GetAdapter()?;
-        let mut selected = None;
-        let mut selected_rect = RECT::default();
+        self.outputs.clear();
         let mut index = 0;
         while let Ok(output) = adapter.EnumOutputs(index) {
             let desc = output.GetDesc()?;
-            let r = desc.DesktopCoordinates;
-            if selected.is_none()
-                || (point.x >= r.left
-                    && point.x < r.right
-                    && point.y >= r.top
-                    && point.y < r.bottom)
-            {
-                selected_rect = r;
-                selected = Some(output);
-                if point.x >= r.left && point.x < r.right && point.y >= r.top && point.y < r.bottom
-                {
-                    break;
-                }
-            }
+            let output1: IDXGIOutput1 = output.cast()?;
+            self.outputs.push(OutputCapture {
+                duplication: output1.DuplicateOutput(&self.device)?,
+                desktop_texture: None,
+                desktop_view: None,
+                rect: desc.DesktopCoordinates,
+            });
             index += 1;
         }
-        let output1: IDXGIOutput1 = selected
-            .ok_or_else(windows::core::Error::from_thread)?
-            .cast()?;
-        self.duplication = None;
-        let duplication = output1.DuplicateOutput(&self.device)?;
-        self.output_rect = selected_rect;
-        self.desktop_view = None;
-        self.desktop_texture = None;
-        self.duplication = Some(duplication);
+        if self.outputs.is_empty() {
+            return Err(windows::core::Error::from_thread());
+        }
         Ok(())
     }
 
-    unsafe fn select_lens_output(&mut self) {
-        let center = POINT {
-            x: LENS_POSITION.x + LENS_W / 2,
-            y: LENS_POSITION.y + LENS_H / 2,
-        };
-        if center.x < self.output_rect.left
-            || center.x >= self.output_rect.right
-            || center.y < self.output_rect.top
-            || center.y >= self.output_rect.bottom
-        {
-            let _ = self.create_duplication(center);
-        }
-    }
-
-    unsafe fn capture(&mut self) {
-        let Some(duplication) = self.duplication.clone() else {
-            return;
-        };
+    unsafe fn capture_output(
+        device: &ID3D11Device,
+        context: &ID3D11DeviceContext,
+        output: &mut OutputCapture,
+    ) {
+        let duplication = output.duplication.clone();
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
         if duplication
             .AcquireNextFrame(
-                if self.desktop_texture.is_some() {
+                if output.desktop_texture.is_some() {
                     0
                 } else {
                     100
@@ -331,7 +316,7 @@ impl Renderer {
             if let Ok(frame) = resource.cast::<ID3D11Texture2D>() {
                 let mut desc = D3D11_TEXTURE2D_DESC::default();
                 frame.GetDesc(&mut desc);
-                let recreate = self.desktop_texture.as_ref().is_none_or(|texture| {
+                let recreate = output.desktop_texture.as_ref().is_none_or(|texture| {
                     let mut old = D3D11_TEXTURE2D_DESC::default();
                     texture.GetDesc(&mut old);
                     old.Width != desc.Width
@@ -344,28 +329,26 @@ impl Renderer {
                     desc.Usage = D3D11_USAGE_DEFAULT;
                     desc.MiscFlags = 0;
                     let mut texture = None;
-                    if self
-                        .device
+                    if device
                         .CreateTexture2D(&desc, None, Some(&mut texture))
                         .is_ok()
                     {
-                        self.desktop_texture = texture;
+                        output.desktop_texture = texture;
                         let mut view = None;
-                        if self
-                            .device
+                        if device
                             .CreateShaderResourceView(
-                                self.desktop_texture.as_ref().unwrap(),
+                                output.desktop_texture.as_ref().unwrap(),
                                 None,
                                 Some(&mut view),
                             )
                             .is_ok()
                         {
-                            self.desktop_view = view;
+                            output.desktop_view = view;
                         }
                     }
                 }
-                if let Some(texture) = &self.desktop_texture {
-                    self.context.CopyResource(texture, &frame);
+                if let Some(texture) = &output.desktop_texture {
+                    context.CopyResource(texture, &frame);
                 }
             }
         }
@@ -373,68 +356,12 @@ impl Renderer {
     }
 
     unsafe fn render(&mut self, hwnd: HWND) {
-        self.select_lens_output();
-        self.capture();
-        let Some(view) = self.desktop_view.clone() else {
-            return;
-        };
+        for output in &mut self.outputs {
+            Self::capture_output(&self.device, &self.context, output);
+        }
         let mut window = RECT::default();
         if GetWindowRect(hwnd, &mut window).is_err() {
             return;
-        }
-        let constants = Constants {
-            output_origin: [self.output_rect.left as f32, self.output_rect.top as f32],
-            output_size: [
-                (self.output_rect.right - self.output_rect.left) as f32,
-                (self.output_rect.bottom - self.output_rect.top) as f32,
-            ],
-            window_origin: [window.left as f32, window.top as f32],
-            window_size: [self.width as f32, self.height as f32],
-            lens_size: [LENS_W as f32, LENS_H as f32],
-            padding: [
-                (LENS_POSITION.x - window.left) as f32,
-                (LENS_POSITION.y - window.top) as f32,
-            ],
-            shadow_settings: [SHADOW_OFFSET_Y, SHADOW_SOFTNESS, SHADOW_OPACITY, 0.0],
-            refraction_settings: [
-                REFRACTION_CORE_X,
-                REFRACTION_CORE_Y,
-                REFRACTION_RADIUS,
-                REFRACTION_TRANSITION,
-            ],
-            effects_settings: [
-                REFRACTION_BIAS,
-                EDGE_EFFECT_WIDTH,
-                CHROMATIC_OFFSET,
-                COLOR_CONTRAST,
-            ],
-            color_settings: [
-                COLOR_GAIN,
-                COLOR_LIFT,
-                TOP_LIGHT_POSITION,
-                TOP_LIGHT_STRENGTH,
-            ],
-            detail_settings: [
-                LOWER_SHADOW_POSITION,
-                LOWER_SHADOW_STRENGTH,
-                AA_DERIVATIVE_SCALE,
-                AA_MIN_HALF_WIDTH,
-            ],
-        };
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        if self
-            .context
-            .Map(
-                &self.constants,
-                0,
-                D3D11_MAP_WRITE_DISCARD,
-                0,
-                Some(&mut mapped),
-            )
-            .is_ok()
-        {
-            mapped.pData.cast::<Constants>().write(constants);
-            self.context.Unmap(&self.constants, 0);
         }
         self.context
             .OMSetRenderTargets(Some(&[Some(self.target.clone())]), None);
@@ -445,6 +372,7 @@ impl Renderer {
             MaxDepth: 1.0,
             ..Default::default()
         }]));
+        self.context.RSSetState(&self.rasterizer);
         self.context.IASetInputLayout(None);
         self.context
             .IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -454,9 +382,75 @@ impl Renderer {
             .PSSetConstantBuffers(0, Some(&[Some(self.constants.clone())]));
         self.context
             .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
-        self.context.PSSetShaderResources(0, Some(&[Some(view)]));
-        self.context.Draw(3, 0);
-        self.context.PSSetShaderResources(0, Some(&[None]));
+        for output in &self.outputs {
+            let Some(view) = output.desktop_view.clone() else {
+                continue;
+            };
+            let constants = Constants {
+                output_origin: [output.rect.left as f32, output.rect.top as f32],
+                output_size: [
+                    (output.rect.right - output.rect.left) as f32,
+                    (output.rect.bottom - output.rect.top) as f32,
+                ],
+                window_origin: [window.left as f32, window.top as f32],
+                window_size: [self.width as f32, self.height as f32],
+                lens_size: [LENS_W as f32, LENS_H as f32],
+                padding: [
+                    (LENS_POSITION.x - window.left) as f32,
+                    (LENS_POSITION.y - window.top) as f32,
+                ],
+                shadow_settings: [SHADOW_OFFSET_Y, SHADOW_SOFTNESS, SHADOW_OPACITY, 0.0],
+                refraction_settings: [
+                    REFRACTION_CORE_X,
+                    REFRACTION_CORE_Y,
+                    REFRACTION_RADIUS,
+                    REFRACTION_TRANSITION,
+                ],
+                effects_settings: [
+                    REFRACTION_BIAS,
+                    EDGE_EFFECT_WIDTH,
+                    CHROMATIC_OFFSET,
+                    COLOR_CONTRAST,
+                ],
+                color_settings: [
+                    COLOR_GAIN,
+                    COLOR_LIFT,
+                    TOP_LIGHT_POSITION,
+                    TOP_LIGHT_STRENGTH,
+                ],
+                detail_settings: [
+                    LOWER_SHADOW_POSITION,
+                    LOWER_SHADOW_STRENGTH,
+                    AA_DERIVATIVE_SCALE,
+                    AA_MIN_HALF_WIDTH,
+                ],
+            };
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if self
+                .context
+                .Map(
+                    &self.constants,
+                    0,
+                    D3D11_MAP_WRITE_DISCARD,
+                    0,
+                    Some(&mut mapped),
+                )
+                .is_err()
+            {
+                continue;
+            }
+            mapped.pData.cast::<Constants>().write(constants);
+            self.context.Unmap(&self.constants, 0);
+            self.context.RSSetScissorRects(Some(&[RECT {
+                left: (output.rect.left - window.left).max(0),
+                top: (output.rect.top - window.top).max(0),
+                right: (output.rect.right - window.left).min(self.width),
+                bottom: (output.rect.bottom - window.top).min(self.height),
+            }]));
+            self.context.PSSetShaderResources(0, Some(&[Some(view)]));
+            self.context.Draw(3, 0);
+            self.context.PSSetShaderResources(0, Some(&[None]));
+        }
         let _ = self.swap_chain.Present(1, DXGI_PRESENT(0));
     }
 }
