@@ -38,6 +38,31 @@ cargo --version
 cargo run
 ```
 
+磨砂液态玻璃示例：
+
+```powershell
+cargo run --example frosted_liquid
+```
+
+该示例在相同的桌面折射基础上增加多采样背景模糊、140% 饱和度、更明显的 RGB
+色散、柔和阴影，以及随鼠标位置改变方向的边缘高光。示例使用
+`Preset::FrostedLiquid`，默认程序仍使用 `Preset::Standard`，两者可以独立调整。
+
+示例保留了 `User Info` 内容。内容由独立透明窗口绘制，因此保持清晰，不会随背景一起
+折射或模糊。玻璃底部的 `Settings` 默认折叠，点击后以阻尼动画展开自绘参数面板；再次
+点击即可收起。
+
+面板覆盖参考组件的全部视觉参数：
+
+- `Refraction mode`：`Standard`、`Polar`、`Prominent`、`Shader`
+- `Displacement scale`：折射位移强度
+- `Blur amount`：磨砂背景的采样半径
+- `Saturation`：玻璃区域的颜色饱和度
+- `Chromatic aberration`：边缘 RGB 色散距离
+- `Elasticity`：玻璃朝鼠标方向产生的弹性形变
+- `Corner radius`：轮廓圆角，最大值为完整胶囊形状
+- `Over light`：在明亮背景上压暗玻璃内容
+
 构建发布版本：
 
 ```powershell
