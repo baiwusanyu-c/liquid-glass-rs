@@ -1306,10 +1306,9 @@ impl Renderer {
                 Self::capture_output(&self.device, &self.context, output);
             }
         }
-        let blur_sigma = scale_effect_for_dpi(
-            (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0,
-            LENS_DPI,
-        );
+        // Desktop duplication is already in physical pixels. Keeping the backdrop blur radius in
+        // that space prevents high-DPI outputs from averaging a substantially larger source area.
+        let blur_sigma = (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0;
         for output in &self.outputs {
             self.blur_output(output, blur_sigma, style.saturation, visual_height);
         }
