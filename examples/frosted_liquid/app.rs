@@ -1603,18 +1603,21 @@ pub fn run(preset: Preset) -> Result<()> {
             SetWindowDisplayAffinity(input_hwnd, WDA_EXCLUDEFROMCAPTURE)?;
         }
         let mut renderer = Renderer::new(hwnd, screen_width, screen_height, preset)?;
-        let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = ShowWindow(input_hwnd, SW_SHOW);
-        if screenshot_mode {
-            for _ in 0..20 {
-                renderer.render(hwnd);
-                if renderer.has_desktop_frame() {
-                    break;
-                }
+        let capture_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !renderer.has_desktop_frame() && std::time::Instant::now() < capture_deadline {
+            renderer.render(hwnd);
+            if !renderer.has_desktop_frame() {
                 std::thread::sleep(std::time::Duration::from_millis(16));
             }
+        }
+        if !renderer.has_desktop_frame() {
+            return Err(windows::core::Error::from_thread());
+        }
+        if screenshot_mode {
             renderer.freeze_capture = true;
         }
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(input_hwnd, SW_SHOW);
         if matches!(preset, Preset::FrostedLiquid) {
             let (panel, panel_input) = demo_ui::create_demo_windows(
                 HINSTANCE(module.0),
