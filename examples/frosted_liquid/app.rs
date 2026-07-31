@@ -1,10 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn, static_mut_refs)]
 
-use std::{
-    mem::size_of,
-    slice,
-    sync::atomic::{AtomicU32, Ordering},
-};
+use std::{mem::size_of, slice, sync::Mutex};
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -72,7 +68,27 @@ mod demo_ui;
 const STANDARD_MAP: &[u8] = include_bytes!("embedded/standard.jpg");
 const POLAR_MAP: &[u8] = include_bytes!("embedded/polar.jpg");
 const PROMINENT_MAP: &[u8] = include_bytes!("embedded/prominent.png");
-static DIAGNOSTIC_FRAME: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DiagnosticKey {
+    output: usize,
+    dpi: u32,
+    blur: u32,
+    displacement: u32,
+    saturation: u32,
+}
+
+struct DiagnosticState {
+    active: Option<DiagnosticKey>,
+    stable_frames: u32,
+    reported: Vec<DiagnosticKey>,
+}
+
+static DIAGNOSTIC_STATE: Mutex<DiagnosticState> = Mutex::new(DiagnosticState {
+    active: None,
+    stable_frames: 0,
+    reported: Vec::new(),
+});
 
 // Lens size in logical pixels at 96 DPI.
 const LENS_W: i32 = 352;
@@ -1297,31 +1313,69 @@ impl Renderer {
         for output in &self.outputs {
             self.blur_output(output, blur_sigma, style.saturation, visual_height);
         }
-        let diagnostic_frame = DIAGNOSTIC_FRAME.fetch_add(1, Ordering::Relaxed);
-        if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() && diagnostic_frame == 120 {
+        let center = POINT {
+            x: LENS_POSITION.x + LENS_SIZE.x / 2,
+            y: LENS_POSITION.y + visual_height / 2,
+        };
+        let active_output = self.outputs.iter().position(|output| {
+            center.x >= output.rect.left
+                && center.x < output.rect.right
+                && center.y >= output.rect.top
+                && center.y < output.rect.bottom
+        });
+        let should_report = if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() {
+            active_output.is_some_and(|output| {
+                let key = DiagnosticKey {
+                    output,
+                    dpi: LENS_DPI,
+                    blur: blur_sigma.to_bits(),
+                    displacement: style.displacement_scale.to_bits(),
+                    saturation: style.saturation.to_bits(),
+                };
+                let mut state = DIAGNOSTIC_STATE.lock().unwrap();
+                if state.active != Some(key) {
+                    state.active = Some(key);
+                    state.stable_frames = 0;
+                } else {
+                    state.stable_frames = state.stable_frames.saturating_add(1);
+                }
+                if state.stable_frames >= 90 && !state.reported.contains(&key) {
+                    state.reported.push(key);
+                    true
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        };
+        if should_report {
+            let index = active_output.unwrap();
+            let output = &self.outputs[index];
             eprintln!(
-                "effect: dpi={}, lens={}x{}, blur={}, displacement={}, saturation={}",
+                "stable[{index}]: dpi={}, lens={}x{}, blur={}, displacement={}, saturation={}, hdr={}",
                 LENS_DPI,
                 LENS_SIZE.x,
                 LENS_SIZE.y,
                 blur_sigma,
                 scale_effect_for_dpi(style.displacement_scale, LENS_DPI),
-                style.saturation
+                style.saturation,
+                output.hdr_active
             );
-            let center = POINT {
-                x: LENS_POSITION.x + LENS_SIZE.x / 2,
-                y: LENS_POSITION.y + visual_height / 2,
-            };
-            for (index, output) in self.outputs.iter().enumerate() {
-                if center.x < output.rect.left
-                    || center.x >= output.rect.right
-                    || center.y < output.rect.top
-                    || center.y >= output.rect.bottom
-                {
-                    continue;
-                }
-                let x = (center.x - output.rect.left) as u32;
-                let y = (center.y - output.rect.top) as u32;
+            let sample_offsets = [
+                (0, 0),
+                (-LENS_SIZE.x / 4, 0),
+                (LENS_SIZE.x / 4, 0),
+                (0, -visual_height / 4),
+                (0, visual_height / 4),
+            ];
+            for (sample, (offset_x, offset_y)) in sample_offsets.into_iter().enumerate() {
+                let position = POINT {
+                    x: center.x + offset_x,
+                    y: center.y + offset_y,
+                };
+                let x = (position.x - output.rect.left) as u32;
+                let y = (position.y - output.rect.top) as u32;
                 let raw = output
                     .desktop_texture
                     .as_ref()
@@ -1331,8 +1385,8 @@ impl Renderer {
                     .as_ref()
                     .and_then(|texture| self.diagnostic_pixel(texture, x, y));
                 eprintln!(
-                    "center[{index}]: position=({}, {}), raw={raw:?}, blurred={blurred:?}",
-                    center.x, center.y
+                    "sample[{index}.{sample}]: position=({}, {}), raw={raw:?}, blurred={blurred:?}",
+                    position.x, position.y
                 );
             }
         }
