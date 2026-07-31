@@ -402,6 +402,7 @@ struct DecodedMap {
 
 struct OutputCapture {
     duplication: IDXGIOutputDuplication,
+    hdr_active: bool,
     desktop_texture: Option<ID3D11Texture2D>,
     desktop_view: Option<ID3D11ShaderResourceView>,
     blurred_texture: Option<ID3D11Texture2D>,
@@ -635,9 +636,18 @@ impl Renderer {
         let mut index = 0;
         while let Ok(output) = adapter.EnumOutputs(index) {
             let desc = output.GetDesc()?;
+            let hdr_active = output
+                .cast::<IDXGIOutput6>()
+                .ok()
+                .and_then(|output| output.GetDesc1().ok())
+                .is_some_and(|desc| {
+                    desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                        || desc.ColorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020
+                });
             let output1: IDXGIOutput1 = output.cast()?;
             self.outputs.push(OutputCapture {
                 duplication: output1.DuplicateOutput(&self.device)?,
+                hdr_active,
                 desktop_texture: None,
                 desktop_view: None,
                 blurred_texture: None,
@@ -770,11 +780,7 @@ impl Renderer {
         };
         let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
         source_texture.GetDesc(&mut texture_desc);
-        let saturation = if texture_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
-            1.0
-        } else {
-            saturation
-        };
+        let saturation = if output.hdr_active { 1.0 } else { saturation };
         let pixel_format = D2D1_PIXEL_FORMAT {
             format: texture_desc.Format,
             alphaMode: D2D1_ALPHA_MODE_IGNORE,
@@ -1304,17 +1310,7 @@ impl Renderer {
                 ],
                 mouse_offset: light_direction,
                 interaction_padding: [
-                    if output.rect.right > output.rect.left
-                        && output.desktop_texture.as_ref().is_some_and(|texture| {
-                            let mut desc = D3D11_TEXTURE2D_DESC::default();
-                            texture.GetDesc(&mut desc);
-                            desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
-                        })
-                    {
-                        1.0
-                    } else {
-                        0.0
-                    },
+                    if output.hdr_active { 1.0 } else { 0.0 },
                     style.refraction_mode,
                 ],
             };
