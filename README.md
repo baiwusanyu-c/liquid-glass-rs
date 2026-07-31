@@ -33,13 +33,30 @@ cargo --version
 
 ## 运行
 
-开发模式：
+### 默认程序
 
 ```powershell
 cargo run
 ```
 
-磨砂液态玻璃示例：
+默认程序运行 `src/main.rs` 中的程序化液态玻璃透镜，不显示参数控制器。透镜区域可直接拖动，
+视觉参数通过源码中的常量配置。
+
+构建默认程序的发布版本：
+
+```powershell
+cargo build --release
+```
+
+生成的程序位于：
+
+```text
+target\release\liquid-glass.exe
+```
+
+这是 Windows GUI 程序，启动后不会显示控制台窗口。
+
+### Frosted Liquid 示例
 
 ```powershell
 cargo run --example frosted_liquid
@@ -71,20 +88,6 @@ Aberration `2`、Elasticity `0.00`、Corner Radius `32px`。
 - `Shader` 不使用静态位移图，位移场由 HLSL 通过圆角矩形 SDF、全局位移归一化、2px 边缘衰减和 8-bit 通道量化生成。
 - 四种模式均使用 R 通道作为 X 位移、B 通道作为 Y 位移，并分别计算 RGB 三路色差采样。
 - backdrop blur 输入和折射采样在卡片边界使用镜像延展，防止卡片外内容混入边缘。
-
-构建发布版本：
-
-```powershell
-cargo build --release
-```
-
-生成的程序位于：
-
-```text
-target\release\liquid-glass.exe
-```
-
-这是 Windows GUI 程序，启动后不会显示控制台窗口。
 
 ## 操作
 
