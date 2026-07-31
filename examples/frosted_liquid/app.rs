@@ -1,6 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn, static_mut_refs)]
 
-use std::{mem::size_of, slice};
+use std::{
+    mem::size_of,
+    slice,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -68,6 +72,7 @@ mod demo_ui;
 const STANDARD_MAP: &[u8] = include_bytes!("embedded/standard.jpg");
 const POLAR_MAP: &[u8] = include_bytes!("embedded/polar.jpg");
 const PROMINENT_MAP: &[u8] = include_bytes!("embedded/prominent.png");
+static DIAGNOSTICS_REPORTED: AtomicBool = AtomicBool::new(false);
 
 // Lens size in logical pixels at 96 DPI.
 const LENS_W: i32 = 352;
@@ -636,14 +641,25 @@ impl Renderer {
         let mut index = 0;
         while let Ok(output) = adapter.EnumOutputs(index) {
             let desc = output.GetDesc()?;
-            let hdr_active = output
+            let color_space = output
                 .cast::<IDXGIOutput6>()
                 .ok()
                 .and_then(|output| output.GetDesc1().ok())
-                .is_some_and(|desc| {
-                    desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
-                        || desc.ColorSpace == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020
-                });
+                .map(|desc| desc.ColorSpace);
+            let hdr_active = color_space.is_some_and(|color_space| {
+                color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
+                    || color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020
+            });
+            if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() {
+                eprintln!(
+                    "output[{index}]: rect=({}, {})-({}, {}), color_space={:?}, hdr={hdr_active}",
+                    desc.DesktopCoordinates.left,
+                    desc.DesktopCoordinates.top,
+                    desc.DesktopCoordinates.right,
+                    desc.DesktopCoordinates.bottom,
+                    color_space
+                );
+            }
             let output1: IDXGIOutput1 = output.cast()?;
             self.outputs.push(OutputCapture {
                 duplication: output1.DuplicateOutput(&self.device)?,
@@ -699,6 +715,12 @@ impl Renderer {
                         || old.Format != desc.Format
                 });
                 if recreate {
+                    if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() {
+                        eprintln!(
+                            "capture: {}x{}, format={:?}",
+                            desc.Width, desc.Height, desc.Format
+                        );
+                    }
                     desc.MipLevels = 1;
                     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
                     desc.CPUAccessFlags = 0;
@@ -1217,6 +1239,19 @@ impl Renderer {
             (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0,
             LENS_DPI,
         );
+        if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some()
+            && !DIAGNOSTICS_REPORTED.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "effect: dpi={}, lens={}x{}, blur={}, displacement={}, saturation={}",
+                LENS_DPI,
+                LENS_SIZE.x,
+                LENS_SIZE.y,
+                blur_sigma,
+                scale_effect_for_dpi(style.displacement_scale, LENS_DPI),
+                style.saturation
+            );
+        }
         for output in &self.outputs {
             self.blur_output(output, blur_sigma, style.saturation, visual_height);
         }
