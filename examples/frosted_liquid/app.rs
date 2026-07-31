@@ -404,6 +404,7 @@ struct Renderer {
     style: EffectStyle,
     light_direction: [f32; 2],
     freeze_capture: bool,
+    diagnostics_enabled: bool,
     displacement_maps: [EmbeddedMap; 3],
 }
 
@@ -431,7 +432,6 @@ struct OutputCapture {
     blurred_view: Option<ID3D11ShaderResourceView>,
     map_texture: Option<ID3D11Texture2D>,
     effect_texture: Option<ID3D11Texture2D>,
-    effect_view: Option<ID3D11ShaderResourceView>,
     rect: RECT,
 }
 
@@ -643,6 +643,7 @@ impl Renderer {
             style: preset.style(),
             light_direction: [0.0, -1.0],
             freeze_capture: false,
+            diagnostics_enabled: std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some(),
             displacement_maps,
         };
         renderer.create_duplications()?;
@@ -665,7 +666,7 @@ impl Renderer {
                 color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
                     || color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020
             });
-            if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() {
+            if self.diagnostics_enabled {
                 eprintln!(
                     "output[{index}]: rect=({}, {})-({}, {}), color_space={:?}, hdr={hdr_active}",
                     desc.DesktopCoordinates.left,
@@ -686,7 +687,6 @@ impl Renderer {
                 blurred_view: None,
                 map_texture: None,
                 effect_texture: None,
-                effect_view: None,
                 rect: desc.DesktopCoordinates,
             });
             index += 1;
@@ -701,8 +701,9 @@ impl Renderer {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         output: &mut OutputCapture,
+        diagnostics_enabled: bool,
     ) {
-        let duplication = output.duplication.clone();
+        let duplication = &output.duplication;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
         if duplication
@@ -731,7 +732,7 @@ impl Renderer {
                         || old.Format != desc.Format
                 });
                 if recreate {
-                    if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() {
+                    if diagnostics_enabled {
                         eprintln!(
                             "capture: {}x{}, format={:?}",
                             desc.Width, desc.Height, desc.Format
@@ -773,25 +774,6 @@ impl Renderer {
                             output.blurred_texture.as_ref().unwrap(),
                             None,
                             Some(&mut output.blurred_view),
-                        );
-                    }
-                    let mut map = None;
-                    if device
-                        .CreateTexture2D(&blur_desc, None, Some(&mut map))
-                        .is_ok()
-                    {
-                        output.map_texture = map;
-                    }
-                    let mut effect = None;
-                    if device
-                        .CreateTexture2D(&blur_desc, None, Some(&mut effect))
-                        .is_ok()
-                    {
-                        output.effect_texture = effect;
-                        let _ = device.CreateShaderResourceView(
-                            output.effect_texture.as_ref().unwrap(),
-                            None,
-                            Some(&mut output.effect_view),
                         );
                     }
                 }
@@ -1308,7 +1290,12 @@ impl Renderer {
         let visual_height = LENS_SIZE.y;
         for output in &mut self.outputs {
             if !self.freeze_capture || output.desktop_texture.is_none() {
-                Self::capture_output(&self.device, &self.context, output);
+                Self::capture_output(
+                    &self.device,
+                    &self.context,
+                    output,
+                    self.diagnostics_enabled,
+                );
             }
         }
         let blur_sigma = scale_effect_for_dpi(
@@ -1328,7 +1315,7 @@ impl Renderer {
                 && center.y >= output.rect.top
                 && center.y < output.rect.bottom
         });
-        let should_report = if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() {
+        let should_report = if self.diagnostics_enabled {
             active_output.is_some_and(|output| {
                 let key = DiagnosticKey {
                     output,

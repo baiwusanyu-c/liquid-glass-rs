@@ -311,7 +311,7 @@ impl Renderer {
         context: &ID3D11DeviceContext,
         output: &mut OutputCapture,
     ) {
-        let duplication = output.duplication.clone();
+        let duplication = &output.duplication;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource = None;
         if duplication
@@ -399,6 +399,15 @@ impl Renderer {
         self.context
             .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         for output in &self.outputs {
+            let scissor = RECT {
+                left: (output.rect.left - window.left).max(0),
+                top: (output.rect.top - window.top).max(0),
+                right: (output.rect.right - window.left).min(self.width),
+                bottom: (output.rect.bottom - window.top).min(self.height),
+            };
+            if scissor.left >= scissor.right || scissor.top >= scissor.bottom {
+                continue;
+            }
             let Some(view) = output.desktop_view.clone() else {
                 continue;
             };
@@ -462,12 +471,7 @@ impl Renderer {
             }
             mapped.pData.cast::<Constants>().write(constants);
             self.context.Unmap(&self.constants, 0);
-            self.context.RSSetScissorRects(Some(&[RECT {
-                left: (output.rect.left - window.left).max(0),
-                top: (output.rect.top - window.top).max(0),
-                right: (output.rect.right - window.left).min(self.width),
-                bottom: (output.rect.bottom - window.top).min(self.height),
-            }]));
+            self.context.RSSetScissorRects(Some(&[scissor]));
             self.context.PSSetShaderResources(0, Some(&[Some(view)]));
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&[None]));
