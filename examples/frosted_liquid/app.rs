@@ -1435,6 +1435,24 @@ impl Renderer {
         self.context
             .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         for output in &self.outputs {
+            let effect_margin = (LENS_SIZE.x as f32 * 0.35).ceil() as i32;
+            let scissor = RECT {
+                left: (LENS_POSITION.x - window.left - effect_margin)
+                    .max(output.rect.left - window.left)
+                    .max(0),
+                top: (LENS_POSITION.y - window.top - effect_margin)
+                    .max(output.rect.top - window.top)
+                    .max(0),
+                right: (LENS_POSITION.x + LENS_SIZE.x - window.left + effect_margin)
+                    .min(output.rect.right - window.left)
+                    .min(self.width),
+                bottom: (LENS_POSITION.y + visual_height - window.top + effect_margin)
+                    .min(output.rect.bottom - window.top)
+                    .min(self.height),
+            };
+            if scissor.left >= scissor.right || scissor.top >= scissor.bottom {
+                continue;
+            }
             let Some(view) = output.blurred_view.clone() else {
                 continue;
             };
@@ -1505,21 +1523,7 @@ impl Renderer {
             }
             mapped.pData.cast::<Constants>().write(constants);
             self.context.Unmap(&self.constants, 0);
-            let effect_margin = (LENS_SIZE.x as f32 * 0.35).ceil() as i32;
-            self.context.RSSetScissorRects(Some(&[RECT {
-                left: (LENS_POSITION.x - window.left - effect_margin)
-                    .max(output.rect.left - window.left)
-                    .max(0),
-                top: (LENS_POSITION.y - window.top - effect_margin)
-                    .max(output.rect.top - window.top)
-                    .max(0),
-                right: (LENS_POSITION.x + LENS_SIZE.x - window.left + effect_margin)
-                    .min(output.rect.right - window.left)
-                    .min(self.width),
-                bottom: (LENS_POSITION.y + visual_height - window.top + effect_margin)
-                    .min(output.rect.bottom - window.top)
-                    .min(self.height),
-            }]));
+            self.context.RSSetScissorRects(Some(&[scissor]));
             self.context
                 .PSSetShaderResources(0, Some(&[Some(view), Some(map_view.clone())]));
             self.context.Draw(3, 0);
