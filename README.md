@@ -71,7 +71,6 @@ Aberration `2`、Elasticity `0.00`、Corner Radius `32px`。
 - `Shader` 不使用静态位移图，位移场由 HLSL 按 React Canvas shader 的 SDF、归一化、2px 边缘衰减和 8-bit 量化规则生成。
 - 四种模式均使用 R 通道作为 X 位移、B 通道作为 Y 位移，并分别计算 RGB 三路色差采样。
 - backdrop blur 输入和折射采样在卡片边界使用镜像延展。该行为通过 React/Chromium 坐标编码与颜色坡度探针验证，可防止卡片外内容混入边缘。
-- 不需要运行时外部图片、`examples/frosted_liquid/assets` 目录或额外第三方图像依赖。
 
 构建发布版本：
 
