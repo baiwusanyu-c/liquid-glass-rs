@@ -3,7 +3,7 @@
 use std::{
     mem::size_of,
     slice,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 use windows::{
     Win32::{
@@ -72,7 +72,7 @@ mod demo_ui;
 const STANDARD_MAP: &[u8] = include_bytes!("embedded/standard.jpg");
 const POLAR_MAP: &[u8] = include_bytes!("embedded/polar.jpg");
 const PROMINENT_MAP: &[u8] = include_bytes!("embedded/prominent.png");
-static DIAGNOSTICS_REPORTED: AtomicBool = AtomicBool::new(false);
+static DIAGNOSTIC_FRAME: AtomicU32 = AtomicU32::new(0);
 
 // Lens size in logical pixels at 96 DPI.
 const LENS_W: i32 = 352;
@@ -408,6 +408,7 @@ struct DecodedMap {
 struct OutputCapture {
     duplication: IDXGIOutputDuplication,
     hdr_active: bool,
+    has_presented_frame: bool,
     desktop_texture: Option<ID3D11Texture2D>,
     desktop_view: Option<ID3D11ShaderResourceView>,
     blurred_texture: Option<ID3D11Texture2D>,
@@ -504,9 +505,7 @@ unsafe fn upload_embedded_map(device: &ID3D11Device, decoded: DecodedMap) -> Res
 
 impl Renderer {
     fn has_desktop_frame(&self) -> bool {
-        self.outputs
-            .iter()
-            .any(|output| output.desktop_view.is_some())
+        self.outputs.iter().any(|output| output.has_presented_frame)
     }
 
     unsafe fn new(hwnd: HWND, width: i32, height: i32, preset: Preset) -> Result<Self> {
@@ -664,6 +663,7 @@ impl Renderer {
             self.outputs.push(OutputCapture {
                 duplication: output1.DuplicateOutput(&self.device)?,
                 hdr_active,
+                has_presented_frame: false,
                 desktop_texture: None,
                 desktop_view: None,
                 blurred_texture: None,
@@ -781,6 +781,9 @@ impl Renderer {
                 }
                 if let Some(texture) = &output.desktop_texture {
                     context.CopyResource(texture, &frame);
+                    if info.AccumulatedFrames > 0 {
+                        output.has_presented_frame = true;
+                    }
                 }
             }
         }
@@ -1294,9 +1297,8 @@ impl Renderer {
         for output in &self.outputs {
             self.blur_output(output, blur_sigma, style.saturation, visual_height);
         }
-        if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some()
-            && !DIAGNOSTICS_REPORTED.swap(true, Ordering::Relaxed)
-        {
+        let diagnostic_frame = DIAGNOSTIC_FRAME.fetch_add(1, Ordering::Relaxed);
+        if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some() && diagnostic_frame == 120 {
             eprintln!(
                 "effect: dpi={}, lens={}x{}, blur={}, displacement={}, saturation={}",
                 LENS_DPI,
