@@ -66,11 +66,11 @@ Aberration `2`、Elasticity `0.00`、Corner Radius `32px`。
 
 ### 折射模式
 
-- `Standard`、`Polar`、`Prominent` 使用 React 实现中原始 Base64 位移图的逐字节解码结果。
+- `Standard`、`Polar`、`Prominent` 分别使用独立的内嵌位移纹理。
 - 三张位移图以二进制资源编译进可执行文件，启动时通过 Windows Imaging Component 解码一次并上传 GPU。
-- `Shader` 不使用静态位移图，位移场由 HLSL 按 React Canvas shader 的 SDF、归一化、2px 边缘衰减和 8-bit 量化规则生成。
+- `Shader` 不使用静态位移图，位移场由 HLSL 通过圆角矩形 SDF、全局位移归一化、2px 边缘衰减和 8-bit 通道量化生成。
 - 四种模式均使用 R 通道作为 X 位移、B 通道作为 Y 位移，并分别计算 RGB 三路色差采样。
-- backdrop blur 输入和折射采样在卡片边界使用镜像延展。该行为通过 React/Chromium 坐标编码与颜色坡度探针验证，可防止卡片外内容混入边缘。
+- backdrop blur 输入和折射采样在卡片边界使用镜像延展，防止卡片外内容混入边缘。
 
 构建发布版本：
 
@@ -160,7 +160,7 @@ liquid-glass/
     `-- frosted_liquid/
         |-- app.rs                   # 捕获、D2D/D3D11 渲染和交互
         |-- demo_ui.rs               # 自绘参数控制器
-        `-- embedded/                # 编译进可执行文件的 React 原始位移图
+        `-- embedded/                # 编译进可执行文件的位移纹理
             |-- standard.jpg
             |-- polar.jpg
             `-- prominent.png
