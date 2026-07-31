@@ -62,6 +62,18 @@ target\release\liquid-glass.exe
 cargo run --example frosted_liquid
 ```
 
+构建示例的发布版本：
+
+```powershell
+cargo build --release --example frosted_liquid
+```
+
+生成的程序位于：
+
+```text
+target\release\examples\frosted_liquid.exe
+```
+
 该示例使用 DXGI Desktop Duplication 捕获桌面，通过 Direct2D 完成裁剪、镜像边缘扩展、
 Gaussian Blur 和饱和度处理，再由 D3D11 像素着色器完成位移折射、RGB 色散、边缘高光、
 阴影和弹性形变。示例窗口固定为 96 DPI 下的 `352 x 236` 逻辑像素，
