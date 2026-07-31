@@ -54,15 +54,12 @@ use windows::{
 mod demo_ui;
 
 // Lens size in logical pixels at 96 DPI.
-// liquid-glass-example: w-72 content + 32px horizontal padding on each side;
-// 188px of User Info content + 24px vertical padding on each side.
 const LENS_W: i32 = 352;
 const LENS_H: i32 = 236;
 
 // Outline anti-aliasing. Increase both slightly for a softer edge.
 const AA_DERIVATIVE_SCALE: f32 = 0.75;
 const AA_MIN_HALF_WIDTH: f32 = 0.75;
-const STANDARD_MAP_RB: &[u8; 256 * 256 * 2] = include_bytes!("assets/standard-map-rb.bin");
 
 /// Visual presets exposed by the executable and examples.
 #[derive(Clone, Copy, Debug, Default)]
@@ -110,11 +107,9 @@ static mut LENS_SIZE: POINT = POINT {
 };
 static mut LENS_DPI: u32 = 96;
 static mut LIVE_STYLE: Option<EffectStyle> = None;
-static mut CONTENT_HWND: Option<HWND> = None;
 static mut PANEL_HWND: Option<HWND> = None;
 
 unsafe fn position_demo_windows(input: HWND) {
-    let collapsed = demo_ui::collapsed_height();
     let _ = SetWindowPos(
         input,
         None,
@@ -124,9 +119,9 @@ unsafe fn position_demo_windows(input: HWND) {
         0,
         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
-    if let Some(content) = CONTENT_HWND {
+    if let Some(panel) = PANEL_HWND {
         let _ = SetWindowPos(
-            content,
+            panel,
             Some(HWND_TOPMOST),
             LENS_POSITION.x,
             LENS_POSITION.y,
@@ -135,17 +130,7 @@ unsafe fn position_demo_windows(input: HWND) {
             SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
-    if let Some(panel) = PANEL_HWND {
-        let _ = SetWindowPos(
-            panel,
-            Some(HWND_TOPMOST),
-            LENS_POSITION.x,
-            LENS_POSITION.y + LENS_SIZE.y - collapsed,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-    }
+    demo_ui::position_windows(LENS_POSITION);
 }
 
 unsafe fn keep_demo_in_work_area(input: HWND) {
@@ -156,7 +141,7 @@ unsafe fn keep_demo_in_work_area(input: HWND) {
     };
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
         let margin = scale_for_dpi(8, LENS_DPI);
-        let total_height = LENS_SIZE.y + demo_ui::glass_extension();
+        let total_height = LENS_SIZE.y;
         let min_y = info.rcWork.top + margin;
         let max_y = (info.rcWork.bottom - margin - total_height).max(min_y);
         let fitted_y = LENS_POSITION.y.clamp(min_y, max_y);
@@ -189,143 +174,67 @@ struct Constants {
     lens_size: [f32; 2],
     padding: [f32; 2],
     shadow_settings: [f32; 4],
-    effect_settings: [f32; 4],
-    interaction_settings: [f32; 4],
+    refraction_settings: [f32; 4],
+    effects_settings: [f32; 4],
+    color_settings: [f32; 4],
+    detail_settings: [f32; 4],
+    control_settings: [f32; 4],
     mouse_offset: [f32; 2],
-    aa_settings: [f32; 2],
+    interaction_padding: [f32; 2],
 }
 
 const SHADER: &str = r#"
 cbuffer C : register(b0) {
  float2 outputOrigin, outputSize, windowOrigin, windowSize, lensSize, padding;
- float4 shadowSettings, effectSettings, interactionSettings;
- float2 mouseOffset, aaSettings;
+ float4 shadowSettings, refractionSettings, effectsSettings, colorSettings, detailSettings, controlSettings;
+ float2 mouseOffset, interactionPadding;
 };
 Texture2D desktop : register(t0);
-Texture2D displacementMap : register(t1);
 SamplerState samp : register(s0);
 struct V { float4 pos:SV_POSITION; float2 uv:TEXCOORD0; };
 V VSMain(uint id:SV_VertexID) { V o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.pos=float4(p*float2(2,-2)+float2(-1,1),0,1); return o; }
 float sdf(float2 p,float2 halfSize,float radius) { float2 q=abs(p)-halfSize+radius; return min(max(q.x,q.y),0)+length(max(q,0))-radius; }
-float gradientAlpha(float position,float stopA,float stopB,float alphaA,float alphaB) {
- if(position<=stopA) return lerp(0,alphaA,saturate(position/max(stopA,.0001)));
- if(position<=stopB) return lerp(alphaA,alphaB,saturate((position-stopA)/max(stopB-stopA,.0001)));
- return lerp(alphaB,0,saturate((position-stopB)/max(1-stopB,.0001)));
-}
-float3 overlayWhite(float3 backdrop) {
- return float3(
-  backdrop.r<=.5 ? backdrop.r*2 : 1,
-  backdrop.g<=.5 ? backdrop.g*2 : 1,
-  backdrop.b<=.5 ? backdrop.b*2 : 1);
-}
-float3 overlayBlack(float3 backdrop) {
- return float3(
-  backdrop.r<=.5 ? 0 : backdrop.r*2-1,
-  backdrop.g<=.5 ? 0 : backdrop.g*2-1,
-  backdrop.b<=.5 ? 0 : backdrop.b*2-1);
-}
-float3 sampleGlass(float2 uv) {
- return desktop.Sample(samp,uv).rgb;
-}
-float3 mapDisplaced(float2 sampleLocal,float2 mapSideSize,float2 texel,float scale,float aberration) {
- float mapSide=max(mapSideSize.x,mapSideSize.y);
- float2 mapUv=(sampleLocal-mapSideSize*.5)/mapSide+.5;
- float2 mapOffset=displacementMap.SampleLevel(samp,mapUv,0).rg-.5;
- float2 screenUv=(windowOrigin+padding+sampleLocal-outputOrigin)/outputSize;
- float3 result;
- result.r=desktop.Sample(samp,screenUv+mapOffset*(-scale)*texel).r;
- result.g=desktop.Sample(samp,screenUv+mapOffset*(-scale*(1+aberration*.05))*texel).g;
- result.b=desktop.Sample(samp,screenUv+mapOffset*(-scale*(1+aberration*.10))*texel).b;
- return result;
-}
 float4 PSMain(V i):SV_TARGET {
  float2 px=i.uv*windowSize, local=px-padding, p=local-lensSize*.5;
- float elasticity=interactionSettings.y;
  float mouseLength=length(mouseOffset);
  float2 mouseDirection=mouseOffset/max(mouseLength,.001);
- float stretchIntensity=min(mouseLength/100,1)*elasticity;
+ float stretch=min(mouseLength/max(lensSize.x,.001),1)*controlSettings.z;
  float2 shapeScale=float2(
-  1+abs(mouseDirection.x)*stretchIntensity*.3-abs(mouseDirection.y)*stretchIntensity*.15,
-  1+abs(mouseDirection.y)*stretchIntensity*.3-abs(mouseDirection.x)*stretchIntensity*.15);
+  1+abs(mouseDirection.x)*stretch*.18-abs(mouseDirection.y)*stretch*.08,
+  1+abs(mouseDirection.y)*stretch*.18-abs(mouseDirection.x)*stretch*.08);
  float2 shapeP=p/shapeScale;
- float radius=min(lensSize.y*.5,interactionSettings.z);
+ float radius=min(lensSize.y*.5,controlSettings.w);
  float d=sdf(shapeP,lensSize*.5,radius); float sd=sdf(shapeP-float2(0,shadowSettings.x),lensSize*.5,radius);
- float shadowSigma=max(shadowSettings.y*.5,.001);
- float shadow=exp(-.5*pow(max(sd,0)/shadowSigma,2))*shadowSettings.z;
- float2 uv=local/lensSize;
- float mode=interactionSettings.w;
- float2 baseScreenUv=(windowOrigin+padding+local-outputOrigin)/outputSize, texel=1/outputSize;
- float2 normal=float2(
-  sdf(shapeP+float2(1,0),lensSize*.5,radius)-sdf(shapeP-float2(1,0),lensSize*.5,radius),
-  sdf(shapeP+float2(0,1),lensSize*.5,radius)-sdf(shapeP-float2(0,1),lensSize*.5,radius));
- normal=normalize(normal+float2(.0001,.0001));
- float edge=saturate(1-smoothstep(0,effectSettings.x,max(-d,0)));
- float profile;
- if(mode<.5) profile=edge*edge;
- else if(mode<1.5) profile=pow(edge,1.35);
- else if(mode<2.5) profile=pow(edge,.68);
- else profile=smoothstep(0,1,edge)*smoothstep(0,1,edge);
- float aberration=effectSettings.y;
- float3 col;
- if(mode<.5) {
-  // The standard source is an opaque JPEG, so React's EDGE_MASK alpha is 1
-  // across the complete filter region. Apply the map without an extra rim fade.
-  float3 mapped=mapDisplaced(local,lensSize,texel,abs(interactionSettings.x),aberration);
-  // xMidYMid slice crops strong side vectors when the unified control panel
-  // makes the surface tall. One 0.471 fallback matches the JPEG rim's measured
-  // average vector magnitude; do not attenuate it a second time while blending.
-  float2 rimDisplacement=-normal*edge*abs(interactionSettings.x)*.471*texel;
-  float3 rim;
-  rim.r=desktop.Sample(samp,baseScreenUv+rimDisplacement).r;
-  rim.g=desktop.Sample(samp,baseScreenUv+rimDisplacement*(1+aberration*.05)).g;
-  rim.b=desktop.Sample(samp,baseScreenUv+rimDisplacement*(1+aberration*.10)).b;
-  col=lerp(mapped,rim,edge);
- } else {
-  float displacementScale=abs(interactionSettings.x)*(interactionSettings.x<0 ? .5 : 1)*.18;
-  float2 displacement=-normal*profile*displacementScale*texel;
-  col.r=sampleGlass(baseScreenUv+displacement).r;
-  col.g=sampleGlass(baseScreenUv+displacement*(1+aberration*.05)).g;
-  col.b=sampleGlass(baseScreenUv+displacement*(1+aberration*.10)).b;
+ float shadow=exp(-pow(max(sd,0)/shadowSettings.y,2))*shadowSettings.z;
+ float2 uv=local/lensSize, center=uv-.5;
+ float mapDistance=sdf(center,refractionSettings.xy,refractionSettings.z);
+ float displacement=smoothstep(refractionSettings.w,0,mapDistance-effectsSettings.x);
+ float scaled=smoothstep(0,1,displacement);
+ float mode=interactionPadding.y;
+ if(mode>.5 && mode<1.5) scaled=pow(scaled,.72);
+ else if(mode>=1.5 && mode<2.5) scaled=pow(scaled,1.55);
+ else if(mode>=2.5) scaled=saturate(scaled+sin(atan2(center.y,center.x)*6)*displacement*.045);
+ float2 source=(center*scaled+.5)*lensSize;
+ float2 screenUv=(windowOrigin+padding+source-outputOrigin)/outputSize, texel=1/outputSize;
+ float edge=saturate(1-smoothstep(0,effectsSettings.y,-d));
+ float2 radial=normalize(center+float2(.0001,.0001));
+ float3 col=desktop.Sample(samp,screenUv).rgb;
+ float chroma=edge*edge*effectsSettings.z;
+ col.r=desktop.Sample(samp,screenUv+radial*texel*chroma).r;
+ col.b=desktop.Sample(samp,screenUv-radial*texel*chroma).b;
+ if(interactionPadding.x>.5) {
+  col=col/(1+max(col-1,0));
+  col=pow(saturate(col),1/2.2);
  }
- // liquid-glass-example avatar: 48px circle at (32px, 68px), bg-black/10.
- float referenceScale=lensSize.x/352;
- float2 avatarCenter=float2(56,92)*referenceScale;
- float avatarDistance=length(local-avatarCenter)-24*referenceScale;
- float avatarMask=smoothstep(max(fwidth(avatarDistance),.5),-max(fwidth(avatarDistance),.5),avatarDistance);
- col=lerp(col,0,avatarMask*.1);
- if(interactionSettings.x<0) {
-  col=overlayBlack(col*.8);
- }
- // CSS linear-gradient angles start at "to top" and rotate clockwise.
- // Convert that convention to screen-space (+Y points down), then normalize
- // against the projected rectangular bounds rather than square UV space.
- float angle=radians(135+mouseOffset.x*1.2);
- float2 gradientDirection=float2(sin(angle),-cos(angle));
- float gradientExtent=max(
-  dot(abs(gradientDirection),lensSize*.5),
-  .0001);
- float gradientPosition=dot(local-lensSize*.5,gradientDirection)/(gradientExtent*2)+.5;
- float stopA=clamp((33+mouseOffset.y*.3)/100,.1,.9);
- float stopB=clamp((66+mouseOffset.y*.4)/100,.1,.9);
- float innerDistance=max(-d,0);
- float borderMask=saturate(1-smoothstep(0,1.5,innerDistance));
- float halfPixelOutline=1-smoothstep(.25,.75,innerDistance);
- float insetDirection=saturate(.5-normal.y*.5);
- float insetGlow=exp(-.5*pow(innerDistance/1.5,2))*insetDirection*.25;
- float insetAlpha=saturate(halfPixelOutline*.5+insetGlow)*borderMask;
- float alpha1=saturate(gradientAlpha(
-  gradientPosition,stopA,stopB,
-  .12+abs(mouseOffset.x)*.008,
-  .4+abs(mouseOffset.x)*.012))*borderMask*.2;
- alpha1=1-(1-alpha1)*(1-insetAlpha*.2);
- col=1-(1-col)*(1-alpha1);
- float alpha2=saturate(gradientAlpha(
-  gradientPosition,stopA,stopB,
-  .32+abs(mouseOffset.x)*.008,
-  .6+abs(mouseOffset.x)*.012))*borderMask;
- alpha2=1-(1-alpha2)*(1-insetAlpha);
- col=lerp(col,overlayWhite(col),alpha2);
- float aa=max(fwidth(d)*aaSettings.x,aaSettings.y);
+ float luminance=dot(col,float3(.2126,.7152,.0722));
+ col=lerp(luminance.xxx,col,controlSettings.y);
+ col=saturate((col-.5)*effectsSettings.w+.5); col=saturate(col*colorSettings.x+colorSettings.y);
+ float2 lightDirection=normalize(mouseOffset+float2(0,-.0001));
+ float2 edgeNormal=normalize(float2(center.x/lensSize.x,center.y/lensSize.y)+float2(.0001,.0001));
+ float directionalLight=edge*saturate(dot(edgeNormal,lightDirection)) * colorSettings.w;
+ float directionalShadow=edge*saturate(dot(edgeNormal,-lightDirection)) * detailSettings.y;
+ col=saturate(col+directionalLight-directionalShadow);
+ float aa=max(fwidth(d)*detailSettings.z,detailSettings.w);
  float glassAlpha=smoothstep(aa,-aa,d);
  float alpha=glassAlpha+shadow*(1-glassAlpha);
  return float4(col*glassAlpha,alpha);
@@ -340,7 +249,6 @@ struct Renderer {
     vertex_shader: ID3D11VertexShader,
     pixel_shader: ID3D11PixelShader,
     constants: ID3D11Buffer,
-    displacement_view: ID3D11ShaderResourceView,
     sampler: ID3D11SamplerState,
     rasterizer: ID3D11RasterizerState,
     outputs: Vec<OutputCapture>,
@@ -469,37 +377,6 @@ impl Renderer {
         };
         let mut sampler = None;
         device.CreateSamplerState(&sampler_desc, Some(&mut sampler))?;
-        let displacement_desc = D3D11_TEXTURE2D_DESC {
-            Width: 256,
-            Height: 256,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: DXGI_FORMAT_R8G8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_IMMUTABLE,
-            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-            ..Default::default()
-        };
-        let displacement_data = D3D11_SUBRESOURCE_DATA {
-            pSysMem: STANDARD_MAP_RB.as_ptr().cast(),
-            SysMemPitch: 256 * 2,
-            ..Default::default()
-        };
-        let mut displacement_texture = None;
-        device.CreateTexture2D(
-            &displacement_desc,
-            Some(&displacement_data),
-            Some(&mut displacement_texture),
-        )?;
-        let mut displacement_view = None;
-        device.CreateShaderResourceView(
-            displacement_texture.as_ref().unwrap(),
-            None,
-            Some(&mut displacement_view),
-        )?;
         let mut rasterizer = None;
         device.CreateRasterizerState(
             &D3D11_RASTERIZER_DESC {
@@ -520,7 +397,6 @@ impl Renderer {
             vertex_shader: vertex_shader.unwrap(),
             pixel_shader: pixel_shader.unwrap(),
             constants: constants.unwrap(),
-            displacement_view: displacement_view.unwrap(),
             sampler: sampler.unwrap(),
             rasterizer: rasterizer.unwrap(),
             outputs: Vec::new(),
@@ -761,6 +637,7 @@ impl Renderer {
         self.d2d_context.SetTarget(None::<&ID2D1Image>);
     }
 
+    #[allow(dead_code)]
     unsafe fn refract_output(
         &self,
         output: &OutputCapture,
@@ -814,13 +691,13 @@ impl Renderer {
             return;
         };
 
-        // Direct2D bitmaps use BGRA memory order. The React map uses R for X and B for Y.
+        // This legacy path is retained for the live controls, but the main renderer no longer
+        // depends on an external displacement-map asset.
         let mut map_pixels = vec![0u8; 256 * 256 * 4];
-        for (source, pixel) in STANDARD_MAP_RB
-            .chunks_exact(2)
-            .zip(map_pixels.chunks_exact_mut(4))
-        {
-            pixel.copy_from_slice(&[source[1], 128, source[0], 255]);
+        for (index, pixel) in map_pixels.chunks_exact_mut(4).enumerate() {
+            let x = index % 256;
+            let y = index / 256;
+            pixel.copy_from_slice(&[y as u8, 128, x as u8, 255]);
         }
         let map_properties = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
@@ -1020,46 +897,27 @@ impl Renderer {
 
     unsafe fn render(&mut self, hwnd: HWND) {
         let style = LIVE_STYLE.unwrap_or(self.style);
-        let glass_extension = demo_ui::glass_extension();
-        let visual_height = LENS_SIZE.y + glass_extension;
+        let visual_height = LENS_SIZE.y;
         for output in &mut self.outputs {
             if !self.freeze_capture || output.desktop_texture.is_none() {
                 Self::capture_output(&self.device, &self.context, output);
             }
         }
-        let blur_sigma = scale_effect_for_dpi(
-            (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0,
-            LENS_DPI,
-        );
-        for output in &self.outputs {
-            self.blur_output(output, blur_sigma, style.saturation, visual_height);
-            self.refract_output(
-                output,
-                scale_effect_for_dpi(style.displacement_scale, LENS_DPI),
-                style.chromatic_offset,
-                scale_effect_for_dpi((0.5 - style.chromatic_offset * 0.1).max(0.1), LENS_DPI),
-                visual_height,
-            );
+        if style.blur_amount > 0.001 {
+            let blur_sigma = scale_effect_for_dpi(style.blur_amount * 24.0, LENS_DPI);
+            for output in &self.outputs {
+                self.blur_output(output, blur_sigma, 1.0, visual_height);
+            }
         }
         let mut window = RECT::default();
         if GetWindowRect(hwnd, &mut window).is_err() {
             return;
         }
         let mut cursor = POINT::default();
-        let monitor = MonitorFromPoint(LENS_POSITION, MONITOR_DEFAULTTONEAREST);
-        let mut monitor_info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let target_light = if GetCursorPos(&mut cursor).is_ok()
-            && GetMonitorInfoW(monitor, &mut monitor_info).as_bool()
-        {
-            let rect = monitor_info.rcMonitor;
-            let width = (rect.right - rect.left).max(1) as f32;
-            let height = (rect.bottom - rect.top).max(1) as f32;
+        let target_light = if GetCursorPos(&mut cursor).is_ok() {
             [
-                (cursor.x as f32 - (rect.left + rect.right) as f32 * 0.5) / width * 100.0,
-                (cursor.y as f32 - (rect.top + rect.bottom) as f32 * 0.5) / height * 100.0,
+                cursor.x as f32 - (LENS_POSITION.x as f32 + LENS_SIZE.x as f32 * 0.5),
+                cursor.y as f32 - (LENS_POSITION.y as f32 + visual_height as f32 * 0.5),
             ]
         } else {
             [0.0, 0.0]
@@ -1088,7 +946,12 @@ impl Renderer {
         self.context
             .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         for output in &self.outputs {
-            let Some(view) = output.blurred_view.clone() else {
+            let view = if style.blur_amount > 0.001 {
+                output.blurred_view.clone()
+            } else {
+                output.desktop_view.clone()
+            };
+            let Some(view) = view else {
                 continue;
             };
             let constants = Constants {
@@ -1105,34 +968,50 @@ impl Renderer {
                     (LENS_POSITION.y - window.top) as f32,
                 ],
                 shadow_settings: [
-                    scale_effect_for_dpi(if style.over_light { 16.0 } else { 12.0 }, LENS_DPI),
-                    scale_effect_for_dpi(if style.over_light { 70.0 } else { 40.0 }, LENS_DPI),
-                    if style.over_light { 0.75 } else { 0.25 },
+                    scale_effect_for_dpi(7.0, LENS_DPI),
+                    scale_effect_for_dpi(9.0, LENS_DPI),
+                    if style.over_light { 0.42 } else { 0.28 },
                     0.0,
                 ],
-                effect_settings: [
-                    scale_effect_for_dpi(30.0, LENS_DPI),
-                    style.chromatic_offset,
-                    scale_effect_for_dpi((0.5 - style.chromatic_offset * 0.1).max(0.1), LENS_DPI),
-                    style.saturation,
+                refraction_settings: [0.30, 0.20, 0.60, 0.80],
+                effects_settings: [
+                    0.15 * (style.displacement_scale / 100.0).clamp(0.0, 2.0),
+                    scale_effect_for_dpi(24.0, LENS_DPI),
+                    scale_effect_for_dpi(style.chromatic_offset, LENS_DPI),
+                    1.04,
                 ],
-                interaction_settings: [
-                    scale_effect_for_dpi(
-                        if style.over_light {
-                            -style.displacement_scale * 0.5
-                        } else {
-                            style.displacement_scale
-                        },
-                        LENS_DPI,
-                    ),
-                    style.elasticity,
-                    scale_effect_for_dpi(style.corner_radius, LENS_DPI),
-                    style.refraction_mode,
+                color_settings: [
+                    if style.over_light { 0.86 } else { 1.025 },
+                    if style.over_light { 0.0 } else { 0.018 },
+                    0.50,
+                    0.07,
                 ],
-                mouse_offset: light_direction,
-                aa_settings: [
+                detail_settings: [
+                    0.34,
+                    0.08,
                     AA_DERIVATIVE_SCALE,
                     scale_effect_for_dpi(AA_MIN_HALF_WIDTH, LENS_DPI),
+                ],
+                control_settings: [
+                    0.0,
+                    style.saturation,
+                    style.elasticity,
+                    scale_effect_for_dpi(style.corner_radius.min(LENS_H as f32 * 0.5), LENS_DPI),
+                ],
+                mouse_offset: light_direction,
+                interaction_padding: [
+                    if output.rect.right > output.rect.left
+                        && output.desktop_texture.as_ref().is_some_and(|texture| {
+                            let mut desc = D3D11_TEXTURE2D_DESC::default();
+                            texture.GetDesc(&mut desc);
+                            desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
+                        })
+                    {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    style.refraction_mode,
                 ],
             };
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -1166,10 +1045,9 @@ impl Renderer {
                     .min(output.rect.bottom - window.top)
                     .min(self.height),
             }]));
-            self.context
-                .PSSetShaderResources(0, Some(&[Some(view), Some(self.displacement_view.clone())]));
+            self.context.PSSetShaderResources(0, Some(&[Some(view)]));
             self.context.Draw(3, 0);
-            self.context.PSSetShaderResources(0, Some(&[None, None]));
+            self.context.PSSetShaderResources(0, Some(&[None]));
         }
         let _ = self.swap_chain.Present(1, DXGI_PRESENT(0));
     }
@@ -1233,9 +1111,9 @@ unsafe extern "system" fn input_proc(
                         0,
                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
                     );
-                    if let Some(content) = CONTENT_HWND {
+                    if let Some(panel) = PANEL_HWND {
                         let _ = SetWindowPos(
-                            content,
+                            panel,
                             Some(HWND_TOPMOST),
                             x,
                             y,
@@ -1244,17 +1122,7 @@ unsafe extern "system" fn input_proc(
                             SWP_NOSIZE | SWP_NOACTIVATE,
                         );
                     }
-                    if let Some(panel) = PANEL_HWND {
-                        let _ = SetWindowPos(
-                            panel,
-                            Some(HWND_TOPMOST),
-                            x,
-                            y + LENS_SIZE.y - demo_ui::collapsed_height(),
-                            0,
-                            0,
-                            SWP_NOSIZE | SWP_NOACTIVATE,
-                        );
-                    }
+                    demo_ui::position_windows(LENS_POSITION);
                 }
             }
             LRESULT(0)
@@ -1267,14 +1135,17 @@ unsafe extern "system" fn input_proc(
         WM_DPICHANGED => {
             let new_dpi = (wparam.0 & 0xffff) as u32;
             if new_dpi != 0 && new_dpi != LENS_DPI {
-                let old_size = LENS_SIZE;
+                let suggested = *(lparam.0 as *const RECT);
                 LENS_DPI = new_dpi;
                 LENS_SIZE = POINT {
                     x: scale_for_dpi(LENS_W, new_dpi),
                     y: scale_for_dpi(LENS_H, new_dpi),
                 };
-                LENS_POSITION.x += (old_size.x - LENS_SIZE.x) / 2;
-                LENS_POSITION.y += (old_size.y - LENS_SIZE.y) / 2;
+                LENS_POSITION = POINT {
+                    x: suggested.left,
+                    y: suggested.top,
+                };
+                demo_ui::update_dpi(LENS_SIZE);
                 let _ = SetWindowPos(
                     hwnd,
                     None,
@@ -1284,28 +1155,18 @@ unsafe extern "system" fn input_proc(
                     LENS_SIZE.y,
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                if let Some(content) = CONTENT_HWND {
-                    let _ = SetWindowPos(
-                        content,
-                        Some(HWND_TOPMOST),
-                        LENS_POSITION.x,
-                        LENS_POSITION.y,
-                        LENS_SIZE.x,
-                        LENS_SIZE.y,
-                        SWP_NOACTIVATE,
-                    );
-                }
                 if let Some(panel) = PANEL_HWND {
                     let _ = SetWindowPos(
                         panel,
                         Some(HWND_TOPMOST),
                         LENS_POSITION.x,
-                        LENS_POSITION.y + LENS_SIZE.y - demo_ui::collapsed_height(),
+                        LENS_POSITION.y,
                         LENS_SIZE.x,
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
                     );
                 }
+                demo_ui::position_windows(LENS_POSITION);
                 let region = CreateRoundRectRgn(
                     0,
                     0,
@@ -1449,18 +1310,17 @@ pub fn run(preset: Preset) -> Result<()> {
             renderer.freeze_capture = true;
         }
         if matches!(preset, Preset::FrostedLiquid) {
-            let (content, panel, panel_input) = demo_ui::create_demo_windows(
+            let (panel, panel_input) = demo_ui::create_demo_windows(
                 HINSTANCE(module.0),
+                input_hwnd,
                 LENS_POSITION,
                 LENS_SIZE,
                 preset.style(),
             )?;
             if !screenshot_mode {
-                SetWindowDisplayAffinity(content, WDA_EXCLUDEFROMCAPTURE)?;
                 SetWindowDisplayAffinity(panel, WDA_EXCLUDEFROMCAPTURE)?;
                 SetWindowDisplayAffinity(panel_input, WDA_EXCLUDEFROMCAPTURE)?;
             }
-            CONTENT_HWND = Some(content);
             PANEL_HWND = Some(panel);
         }
         let mut msg = MSG::default();
@@ -1476,7 +1336,6 @@ pub fn run(preset: Preset) -> Result<()> {
             }
             renderer.render(hwnd);
             if matches!(preset, Preset::FrostedLiquid) {
-                demo_ui::tick();
                 keep_demo_in_work_area(input_hwnd);
             }
         }

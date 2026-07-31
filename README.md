@@ -11,6 +11,7 @@
 - 支持多显示器和虚拟桌面负坐标
 - 透镜跨屏后自动切换桌面捕获源
 - Per-Monitor V2 DPI 感知
+- `frosted_liquid` 示例支持 HDR/scRGB 桌面捕获的色调映射
 - 基于 SDF 像素导数的轮廓抗锯齿
 - 捕获排除，透镜窗口不会递归出现在自己的画面中
 - 所有常用视觉参数集中在 Rust 源文件顶部
@@ -44,24 +45,23 @@ cargo run
 cargo run --example frosted_liquid
 ```
 
-该示例在相同的桌面折射基础上增加多采样背景模糊、140% 饱和度、更明显的 RGB
-色散、柔和阴影，以及随鼠标位置改变方向的边缘高光。示例使用
-`Preset::FrostedLiquid`，默认程序仍使用 `Preset::Standard`，两者可以独立调整。
+该示例复用默认程序的桌面折射基础，并增加 Direct2D Gaussian Blur、可调饱和度、RGB
+色散、鼠标方向边缘高光和弹性形变。示例窗口固定为 96 DPI 下的 `352 x 236` 逻辑像素，
+只显示始终展开的参数控制器；顶部空白区域用于拖动窗口。
 
-示例保留了 `User Info` 内容。内容由独立透明窗口绘制，因此保持清晰，不会随背景一起
-折射或模糊。玻璃底部的 `Settings` 默认折叠，点击后以阻尼动画展开自绘参数面板；再次
-点击即可收起。
-
-面板覆盖参考组件的全部视觉参数：
+控制器参数会实时作用于渲染：
 
 - `Refraction mode`：`Standard`、`Polar`、`Prominent`、`Shader`
 - `Displacement scale`：折射位移强度
-- `Blur amount`：磨砂背景的采样半径
+- `Blur amount`：Direct2D 高斯背景模糊强度
 - `Saturation`：玻璃区域的颜色饱和度
 - `Chromatic aberration`：边缘 RGB 色散距离
 - `Elasticity`：玻璃朝鼠标方向产生的弹性形变
 - `Corner radius`：轮廓圆角，最大值为完整胶囊形状
 - `Over light`：在明亮背景上压暗玻璃内容
+
+默认值为：Displacement `100`、Blur `0.5`、Saturation `140%`、Chromatic
+Aberration `2`、Elasticity `0.00`、Corner Radius `32px`。
 
 构建发布版本：
 
@@ -79,20 +79,22 @@ target\release\liquid-glass.exe
 
 ## 操作
 
-- 在透镜区域按住鼠标左键并拖动，可以移动透镜。
+- 默认程序可在透镜区域按住鼠标左键拖动。
+- `frosted_liquid` 示例通过控制器顶部的空白区域拖动；控件区域用于调整参数。
 - 按 `Esc` 退出程序。
 - 透镜可以移动到主显示器左侧或上方的屏幕。
 
 ## 调整效果
 
-所有常用参数都位于 `src/main.rs` 顶部。修改后重新运行 `cargo run` 或重新构建即可。
+默认程序的常用参数位于 `src/main.rs` 顶部。`frosted_liquid` 示例的初始值位于
+`examples/frosted_liquid/app.rs`，运行时也可以通过控制器调整。
 
 ### 尺寸
 
 | 参数 | 说明 |
 | --- | --- |
-| `LENS_W` | 透镜宽度，单位为物理像素 |
-| `LENS_H` | 透镜高度，单位为物理像素，同时决定胶囊圆角半径 |
+| `LENS_W` | 透镜宽度，单位为 96 DPI 下的逻辑像素 |
+| `LENS_H` | 透镜高度，单位为 96 DPI 下的逻辑像素，同时决定默认胶囊圆角半径 |
 
 ### 阴影
 
@@ -140,17 +142,26 @@ target\release\liquid-glass.exe
 
 ```text
 liquid-glass/
-|-- Cargo.toml       # 包信息、Windows API 功能依赖
-|-- Cargo.lock       # 锁定的依赖版本
-`-- src/
-    `-- main.rs      # Win32 窗口、桌面捕获、D3D11 渲染和 HLSL 着色器
+|-- Cargo.toml                       # 包信息、Windows API 功能依赖
+|-- Cargo.lock                       # 锁定的依赖版本
+|-- src/
+|   `-- main.rs                      # 默认液态玻璃程序
+`-- examples/
+    |-- frosted_liquid.rs            # 示例入口
+    `-- frosted_liquid/
+        |-- app.rs                   # 捕获、D2D/D3D11 渲染和交互
+        `-- demo_ui.rs               # 自绘参数控制器
 ```
 
 ## 实现概要
 
-程序创建两个顶层窗口：一个覆盖虚拟桌面的透明渲染窗口，以及一个与透镜位置同步的
-输入窗口。DXGI Desktop Duplication 捕获透镜中心所在的显示器，D3D11 像素着色器
-使用有符号距离场计算胶囊轮廓，并完成折射和透明度合成。
+默认程序创建两个顶层窗口：一个覆盖虚拟桌面的透明渲染窗口，以及一个与透镜位置同步的
+输入窗口。程序为显卡连接的各个输出建立 DXGI Desktop Duplication，在透镜跨越屏幕边界
+时分别绘制相交区域。D3D11 像素着色器使用有符号距离场计算轮廓，并完成折射和透明度合成。
+
+`frosted_liquid` 另外创建控制器的可视窗口和透明点击窗口。两者在拖动和
+`WM_DPICHANGED` 时同步位置与尺寸；背景模糊由 Direct2D Gaussian Blur 完成，折射、色差、
+轮廓和鼠标高光由 D3D11 像素着色器完成。
 
 多显示器坐标统一使用 Windows 虚拟桌面坐标，因此位于主屏左侧或上方的显示器所产生
 的负坐标也能正确处理。
@@ -158,8 +169,8 @@ liquid-glass/
 ## 检查
 
 ```powershell
-cargo fmt -- --check
-cargo check
+cargo fmt --all -- --check
+cargo check --all-targets
 cargo test
 ```
 
