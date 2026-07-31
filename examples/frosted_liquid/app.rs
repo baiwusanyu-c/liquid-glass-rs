@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn, static_mut_refs)]
 
-use std::{mem::size_of, slice, sync::Mutex};
+use std::{mem::size_of, slice};
 use windows::{
     Win32::{
         Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM},
@@ -68,27 +68,6 @@ mod demo_ui;
 const STANDARD_MAP: &[u8] = include_bytes!("embedded/standard.jpg");
 const POLAR_MAP: &[u8] = include_bytes!("embedded/polar.jpg");
 const PROMINENT_MAP: &[u8] = include_bytes!("embedded/prominent.png");
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct DiagnosticKey {
-    output: usize,
-    dpi: u32,
-    blur: u32,
-    displacement: u32,
-    saturation: u32,
-}
-
-struct DiagnosticState {
-    active: Option<DiagnosticKey>,
-    stable_frames: u32,
-    reported: Vec<DiagnosticKey>,
-}
-
-static DIAGNOSTIC_STATE: Mutex<DiagnosticState> = Mutex::new(DiagnosticState {
-    active: None,
-    stable_frames: 0,
-    reported: Vec::new(),
-});
 
 // Lens size in logical pixels at 96 DPI.
 const LENS_W: i32 = 352;
@@ -404,7 +383,6 @@ struct Renderer {
     style: EffectStyle,
     light_direction: [f32; 2],
     freeze_capture: bool,
-    diagnostics_enabled: bool,
     displacement_maps: [EmbeddedMap; 3],
 }
 
@@ -643,7 +621,6 @@ impl Renderer {
             style: preset.style(),
             light_direction: [0.0, -1.0],
             freeze_capture: false,
-            diagnostics_enabled: std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some(),
             displacement_maps,
         };
         renderer.create_duplications()?;
@@ -666,16 +643,6 @@ impl Renderer {
                 color_space == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020
                     || color_space == DXGI_COLOR_SPACE_RGB_STUDIO_G2084_NONE_P2020
             });
-            if self.diagnostics_enabled {
-                eprintln!(
-                    "output[{index}]: rect=({}, {})-({}, {}), color_space={:?}, hdr={hdr_active}",
-                    desc.DesktopCoordinates.left,
-                    desc.DesktopCoordinates.top,
-                    desc.DesktopCoordinates.right,
-                    desc.DesktopCoordinates.bottom,
-                    color_space
-                );
-            }
             let output1: IDXGIOutput1 = output.cast()?;
             self.outputs.push(OutputCapture {
                 duplication: output1.DuplicateOutput(&self.device)?,
@@ -701,7 +668,6 @@ impl Renderer {
         device: &ID3D11Device,
         context: &ID3D11DeviceContext,
         output: &mut OutputCapture,
-        diagnostics_enabled: bool,
     ) {
         let duplication = &output.duplication;
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -732,12 +698,6 @@ impl Renderer {
                         || old.Format != desc.Format
                 });
                 if recreate {
-                    if diagnostics_enabled {
-                        eprintln!(
-                            "capture: {}x{}, format={:?}",
-                            desc.Width, desc.Height, desc.Format
-                        );
-                    }
                     desc.MipLevels = 1;
                     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE.0 as u32;
                     desc.CPUAccessFlags = 0;
@@ -786,63 +746,6 @@ impl Renderer {
             }
         }
         let _ = duplication.ReleaseFrame();
-    }
-
-    unsafe fn diagnostic_pixel(
-        &self,
-        texture: &ID3D11Texture2D,
-        x: u32,
-        y: u32,
-    ) -> Option<[u8; 4]> {
-        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
-        texture.GetDesc(&mut source_desc);
-        if (source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
-            && source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
-            || x >= source_desc.Width
-            || y >= source_desc.Height
-        {
-            return None;
-        }
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Width: 1,
-            Height: 1,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: source_desc.Format,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            Usage: D3D11_USAGE_STAGING,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            ..Default::default()
-        };
-        let mut staging = None;
-        self.device
-            .CreateTexture2D(&staging_desc, None, Some(&mut staging))
-            .ok()?;
-        let staging = staging?;
-        let source_box = D3D11_BOX {
-            left: x,
-            top: y,
-            front: 0,
-            right: x + 1,
-            bottom: y + 1,
-            back: 1,
-        };
-        self.context
-            .CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&source_box));
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        self.context
-            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            .ok()?;
-        let pixel = *(mapped.pData.cast::<[u8; 4]>());
-        self.context.Unmap(&staging, 0);
-        Some(if source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM {
-            [pixel[2], pixel[1], pixel[0], pixel[3]]
-        } else {
-            pixel
-        })
     }
 
     unsafe fn blur_output(
@@ -1290,12 +1193,7 @@ impl Renderer {
         let visual_height = LENS_SIZE.y;
         for output in &mut self.outputs {
             if !self.freeze_capture || output.desktop_texture.is_none() {
-                Self::capture_output(
-                    &self.device,
-                    &self.context,
-                    output,
-                    self.diagnostics_enabled,
-                );
+                Self::capture_output(&self.device, &self.context, output);
             }
         }
         let blur_sigma = scale_effect_for_dpi(
@@ -1304,83 +1202,6 @@ impl Renderer {
         );
         for output in &self.outputs {
             self.blur_output(output, blur_sigma, style.saturation, visual_height);
-        }
-        let center = POINT {
-            x: LENS_POSITION.x + LENS_SIZE.x / 2,
-            y: LENS_POSITION.y + visual_height / 2,
-        };
-        let active_output = self.outputs.iter().position(|output| {
-            center.x >= output.rect.left
-                && center.x < output.rect.right
-                && center.y >= output.rect.top
-                && center.y < output.rect.bottom
-        });
-        let should_report = if self.diagnostics_enabled {
-            active_output.is_some_and(|output| {
-                let key = DiagnosticKey {
-                    output,
-                    dpi: LENS_DPI,
-                    blur: blur_sigma.to_bits(),
-                    displacement: style.displacement_scale.to_bits(),
-                    saturation: style.saturation.to_bits(),
-                };
-                let mut state = DIAGNOSTIC_STATE.lock().unwrap();
-                if state.active != Some(key) {
-                    state.active = Some(key);
-                    state.stable_frames = 0;
-                } else {
-                    state.stable_frames = state.stable_frames.saturating_add(1);
-                }
-                if state.stable_frames >= 90 && !state.reported.contains(&key) {
-                    state.reported.push(key);
-                    true
-                } else {
-                    false
-                }
-            })
-        } else {
-            false
-        };
-        if should_report {
-            let index = active_output.unwrap();
-            let output = &self.outputs[index];
-            eprintln!(
-                "stable[{index}]: dpi={}, lens={}x{}, blur={}, displacement={}, saturation={}, hdr={}",
-                LENS_DPI,
-                LENS_SIZE.x,
-                LENS_SIZE.y,
-                blur_sigma,
-                scale_effect_for_dpi(style.displacement_scale, LENS_DPI),
-                style.saturation,
-                output.hdr_active
-            );
-            let sample_offsets = [
-                (0, 0),
-                (-LENS_SIZE.x / 4, 0),
-                (LENS_SIZE.x / 4, 0),
-                (0, -visual_height / 4),
-                (0, visual_height / 4),
-            ];
-            for (sample, (offset_x, offset_y)) in sample_offsets.into_iter().enumerate() {
-                let position = POINT {
-                    x: center.x + offset_x,
-                    y: center.y + offset_y,
-                };
-                let x = (position.x - output.rect.left) as u32;
-                let y = (position.y - output.rect.top) as u32;
-                let raw = output
-                    .desktop_texture
-                    .as_ref()
-                    .and_then(|texture| self.diagnostic_pixel(texture, x, y));
-                let blurred = output
-                    .blurred_texture
-                    .as_ref()
-                    .and_then(|texture| self.diagnostic_pixel(texture, x, y));
-                eprintln!(
-                    "sample[{index}.{sample}]: position=({}, {}), raw={raw:?}, blurred={blurred:?}",
-                    position.x, position.y
-                );
-            }
         }
         let mode = style.refraction_mode.round().clamp(0.0, 3.0) as usize;
         let displacement_scale =
@@ -1515,21 +1336,6 @@ impl Renderer {
                 .PSSetShaderResources(0, Some(&[Some(view), Some(map_view.clone())]));
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&[None, None]));
-        }
-        if should_report {
-            if let Ok(back_buffer) = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) {
-                let x = center.x - window.left;
-                let y = center.y - window.top;
-                let final_pixel = if x >= 0 && y >= 0 {
-                    self.diagnostic_pixel(&back_buffer, x as u32, y as u32)
-                } else {
-                    None
-                };
-                eprintln!(
-                    "final: position=({}, {}), rgba={final_pixel:?}",
-                    center.x, center.y
-                );
-            }
         }
         let _ = self.swap_chain.Present(1, DXGI_PRESENT(0));
     }
