@@ -814,7 +814,8 @@ impl Renderer {
     ) -> Option<[u8; 4]> {
         let mut source_desc = D3D11_TEXTURE2D_DESC::default();
         texture.GetDesc(&mut source_desc);
-        if source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+        if (source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            && source_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM)
             || x >= source_desc.Width
             || y >= source_desc.Height
         {
@@ -853,9 +854,13 @@ impl Renderer {
         self.context
             .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             .ok()?;
-        let bgra = *(mapped.pData.cast::<[u8; 4]>());
+        let pixel = *(mapped.pData.cast::<[u8; 4]>());
         self.context.Unmap(&staging, 0);
-        Some([bgra[2], bgra[1], bgra[0], bgra[3]])
+        Some(if source_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM {
+            [pixel[2], pixel[1], pixel[0], pixel[3]]
+        } else {
+            pixel
+        })
     }
 
     unsafe fn blur_output(
@@ -1306,9 +1311,10 @@ impl Renderer {
                 Self::capture_output(&self.device, &self.context, output);
             }
         }
-        // Desktop duplication is already in physical pixels. Keeping the backdrop blur radius in
-        // that space prevents high-DPI outputs from averaging a substantially larger source area.
-        let blur_sigma = (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0;
+        let blur_sigma = scale_effect_for_dpi(
+            (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0,
+            LENS_DPI,
+        );
         for output in &self.outputs {
             self.blur_output(output, blur_sigma, style.saturation, visual_height);
         }
@@ -1518,6 +1524,21 @@ impl Renderer {
                 .PSSetShaderResources(0, Some(&[Some(view), Some(map_view.clone())]));
             self.context.Draw(3, 0);
             self.context.PSSetShaderResources(0, Some(&[None, None]));
+        }
+        if should_report {
+            if let Ok(back_buffer) = self.swap_chain.GetBuffer::<ID3D11Texture2D>(0) {
+                let x = center.x - window.left;
+                let y = center.y - window.top;
+                let final_pixel = if x >= 0 && y >= 0 {
+                    self.diagnostic_pixel(&back_buffer, x as u32, y as u32)
+                } else {
+                    None
+                };
+                eprintln!(
+                    "final: position=({}, {}), rgba={final_pixel:?}",
+                    center.x, center.y
+                );
+            }
         }
         let _ = self.swap_chain.Present(1, DXGI_PRESENT(0));
     }
