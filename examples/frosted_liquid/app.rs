@@ -787,6 +787,58 @@ impl Renderer {
         let _ = duplication.ReleaseFrame();
     }
 
+    unsafe fn diagnostic_pixel(
+        &self,
+        texture: &ID3D11Texture2D,
+        x: u32,
+        y: u32,
+    ) -> Option<[u8; 4]> {
+        let mut source_desc = D3D11_TEXTURE2D_DESC::default();
+        texture.GetDesc(&mut source_desc);
+        if source_desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM
+            || x >= source_desc.Width
+            || y >= source_desc.Height
+        {
+            return None;
+        }
+        let staging_desc = D3D11_TEXTURE2D_DESC {
+            Width: 1,
+            Height: 1,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: source_desc.Format,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_STAGING,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..Default::default()
+        };
+        let mut staging = None;
+        self.device
+            .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+            .ok()?;
+        let staging = staging?;
+        let source_box = D3D11_BOX {
+            left: x,
+            top: y,
+            front: 0,
+            right: x + 1,
+            bottom: y + 1,
+            back: 1,
+        };
+        self.context
+            .CopySubresourceRegion(&staging, 0, 0, 0, 0, texture, 0, Some(&source_box));
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        self.context
+            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .ok()?;
+        let bgra = *(mapped.pData.cast::<[u8; 4]>());
+        self.context.Unmap(&staging, 0);
+        Some([bgra[2], bgra[1], bgra[0], bgra[3]])
+    }
+
     unsafe fn blur_output(
         &self,
         output: &OutputCapture,
@@ -1239,6 +1291,9 @@ impl Renderer {
             (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0,
             LENS_DPI,
         );
+        for output in &self.outputs {
+            self.blur_output(output, blur_sigma, style.saturation, visual_height);
+        }
         if std::env::var_os("LIQUID_GLASS_DIAGNOSTICS").is_some()
             && !DIAGNOSTICS_REPORTED.swap(true, Ordering::Relaxed)
         {
@@ -1251,9 +1306,33 @@ impl Renderer {
                 scale_effect_for_dpi(style.displacement_scale, LENS_DPI),
                 style.saturation
             );
-        }
-        for output in &self.outputs {
-            self.blur_output(output, blur_sigma, style.saturation, visual_height);
+            let center = POINT {
+                x: LENS_POSITION.x + LENS_SIZE.x / 2,
+                y: LENS_POSITION.y + visual_height / 2,
+            };
+            for (index, output) in self.outputs.iter().enumerate() {
+                if center.x < output.rect.left
+                    || center.x >= output.rect.right
+                    || center.y < output.rect.top
+                    || center.y >= output.rect.bottom
+                {
+                    continue;
+                }
+                let x = (center.x - output.rect.left) as u32;
+                let y = (center.y - output.rect.top) as u32;
+                let raw = output
+                    .desktop_texture
+                    .as_ref()
+                    .and_then(|texture| self.diagnostic_pixel(texture, x, y));
+                let blurred = output
+                    .blurred_texture
+                    .as_ref()
+                    .and_then(|texture| self.diagnostic_pixel(texture, x, y));
+                eprintln!(
+                    "center[{index}]: position=({}, {}), raw={raw:?}, blurred={blurred:?}",
+                    center.x, center.y
+                );
+            }
         }
         let mode = style.refraction_mode.round().clamp(0.0, 3.0) as usize;
         let displacement_scale =
