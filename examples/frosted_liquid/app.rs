@@ -11,16 +11,18 @@ use windows::{
                 D2D1_PIXEL_FORMAT,
             },
             Direct2D::{
-                CLSID_D2D1Blend, CLSID_D2D1ColorMatrix, CLSID_D2D1DisplacementMap,
-                CLSID_D2D1GaussianBlur, CLSID_D2D1Saturation, D2D1_BITMAP_OPTIONS_NONE,
+                CLSID_D2D1Blend, CLSID_D2D1Border, CLSID_D2D1ColorMatrix, CLSID_D2D1Crop,
+                CLSID_D2D1DisplacementMap, CLSID_D2D1GaussianBlur, D2D1_BITMAP_OPTIONS_NONE,
                 D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_BLEND_PROP_MODE,
-                D2D1_CHANNEL_SELECTOR_B, D2D1_CHANNEL_SELECTOR_R,
-                D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-                D2D1_DISPLACEMENTMAP_PROP_SCALE, D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT,
+                D2D1_BORDER_EDGE_MODE_MIRROR, D2D1_BORDER_PROP_EDGE_MODE_X,
+                D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_CHANNEL_SELECTOR_B, D2D1_CHANNEL_SELECTOR_R,
+                D2D1_COLORMATRIX_PROP_COLOR_MATRIX, D2D1_CROP_PROP_RECT,
+                D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_DISPLACEMENTMAP_PROP_SCALE,
+                D2D1_DISPLACEMENTMAP_PROP_X_CHANNEL_SELECT,
                 D2D1_DISPLACEMENTMAP_PROP_Y_CHANNEL_SELECT,
                 D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, D2D1_INTERPOLATION_MODE_LINEAR,
                 D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT, D2D1_PROPERTY_TYPE_MATRIX_5X4,
-                D2D1_SATURATION_PROP_SATURATION, D2D1CreateDevice, ID2D1DeviceContext, ID2D1Image,
+                D2D1_PROPERTY_TYPE_VECTOR4, D2D1CreateDevice, ID2D1DeviceContext, ID2D1Image,
             },
             Direct3D::{
                 D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_0,
@@ -34,8 +36,18 @@ use windows::{
                 CreateRoundRectRgn, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO,
                 MonitorFromPoint, SetWindowRgn,
             },
+            Imaging::{
+                CLSID_WICImagingFactory, GUID_WICPixelFormat32bppBGRA, IWICBitmapSource,
+                IWICImagingFactory, IWICPalette, WICBitmapDitherTypeNone,
+                WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnLoad,
+            },
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            },
+            LibraryLoader::GetModuleHandleW,
+        },
         UI::{
             Controls::MARGINS,
             HiDpi::{
@@ -52,6 +64,10 @@ use windows::{
 };
 
 mod demo_ui;
+
+const STANDARD_MAP: &[u8] = include_bytes!("embedded/standard.jpg");
+const POLAR_MAP: &[u8] = include_bytes!("embedded/polar.jpg");
+const PROMINENT_MAP: &[u8] = include_bytes!("embedded/prominent.png");
 
 // Lens size in logical pixels at 96 DPI.
 const LENS_W: i32 = 352;
@@ -190,50 +206,160 @@ cbuffer C : register(b0) {
  float2 mouseOffset, interactionPadding;
 };
 Texture2D desktop : register(t0);
+Texture2D displacementMap : register(t1);
 SamplerState samp : register(s0);
 struct V { float4 pos:SV_POSITION; float2 uv:TEXCOORD0; };
 V VSMain(uint id:SV_VertexID) { V o; float2 p=float2((id<<1)&2,id&2); o.uv=p; o.pos=float4(p*float2(2,-2)+float2(-1,1),0,1); return o; }
 float sdf(float2 p,float2 halfSize,float radius) { float2 q=abs(p)-halfSize+radius; return min(max(q.x,q.y),0)+length(max(q,0))-radius; }
+float gaussianTail(float distance,float sigma) {
+ float x=max(distance,0)/(max(sigma,.001)*1.41421356);
+ float t=1/(1+.3275911*x);
+ float erfValue=1-(((((1.061405429*t-1.453152027)*t+1.421413741)*t-.284496736)*t+.254829592)*t)*exp(-x*x);
+ return .5*(1-erfValue);
+}
+float2 proceduralMapTexel(float2 pixel,float2 size,float maxScale) {
+ pixel=clamp(pixel,float2(0,0),size-1);
+ float2 uv=pixel/size,center=uv-.5;
+ float mapDistance=sdf(center,float2(.3,.2),.6);
+ float displacement=smoothstep(.8,0,mapDistance-.15);
+ float scaled=smoothstep(0,1,displacement);
+ float2 rawOffset=(center*scaled+.5-uv)*size;
+ float edgeDistance=min(min(pixel.x,pixel.y),min(size.x-pixel.x-1,size.y-pixel.y-1));
+ float edgeFactor=saturate(edgeDistance/2);
+ float2 encoded=clamp(rawOffset/max(maxScale,1),-.5,.5)*edgeFactor;
+ return round(saturate(encoded+.5)*255)/255-.5;
+}
+float2 sampleProceduralMap(float2 local,float2 physicalSize,float dpiScale,float maxScale) {
+ float2 size=physicalSize/dpiScale;
+ float2 source=local/dpiScale-.5;
+ float2 base=floor(source),fraction=frac(source);
+ float2 top=lerp(
+  proceduralMapTexel(base,size,maxScale),
+  proceduralMapTexel(base+float2(1,0),size,maxScale),fraction.x);
+ float2 bottom=lerp(
+  proceduralMapTexel(base+float2(0,1),size,maxScale),
+  proceduralMapTexel(base+float2(1,1),size,maxScale),fraction.x);
+ return lerp(top,bottom,fraction.y);
+}
+float gradientAlpha(float position,float stopA,float stopB,float alphaA,float alphaB) {
+ if(position<=stopA) return lerp(0,alphaA,saturate(position/max(stopA,.0001)));
+ if(position<=stopB) return lerp(alphaA,alphaB,saturate((position-stopA)/max(stopB-stopA,.0001)));
+ return lerp(alphaB,0,saturate((position-stopB)/max(1-stopB,.0001)));
+}
+float3 overlayWhite(float3 backdrop) {
+ return float3(
+  backdrop.r<=.5 ? backdrop.r*2 : 1,
+  backdrop.g<=.5 ? backdrop.g*2 : 1,
+  backdrop.b<=.5 ? backdrop.b*2 : 1);
+}
+float3 linearToSrgb(float3 value) {
+ value=saturate(value);
+ float3 low=value*12.92;
+ float3 high=1.055*pow(value,1/2.4)-.055;
+ return lerp(low,high,step(.0031308,value));
+}
+float3 cssSaturate(float3 value,float amount) {
+ return float3(
+  dot(value,float3(.213+.787*amount,.715-.715*amount,.072-.072*amount)),
+  dot(value,float3(.213-.213*amount,.715+.285*amount,.072-.072*amount)),
+  dot(value,float3(.213-.213*amount,.715-.715*amount,.072+.928*amount)));
+}
+float2 mirrorSource(float2 uv,float2 minimum,float2 maximum,float2 texel) {
+ if(uv.x<minimum.x) uv.x=2*minimum.x-uv.x;
+ if(uv.y<minimum.y) uv.y=2*minimum.y-uv.y;
+ if(uv.x>maximum.x) uv.x=2*maximum.x-uv.x;
+ if(uv.y>maximum.y) uv.y=2*maximum.y-uv.y;
+ return clamp(uv,minimum+texel*.5,maximum-texel*.5);
+}
+float3 sampleChromatic(
+ float2 baseUv,float2 offsetPx,float2 texel,float aberration,float baseScale,
+ float2 sourceMinimum,float2 sourceMaximum) {
+ float2 redUv=mirrorSource(
+  baseUv+offsetPx*baseScale*texel,sourceMinimum,sourceMaximum,texel);
+ float2 greenUv=mirrorSource(
+  baseUv+offsetPx*(baseScale-aberration*.05)*texel,sourceMinimum,sourceMaximum,texel);
+ float2 blueUv=mirrorSource(
+  baseUv+offsetPx*(baseScale-aberration*.10)*texel,sourceMinimum,sourceMaximum,texel);
+ return float3(
+  desktop.Sample(samp,redUv).r,
+  desktop.Sample(samp,greenUv).g,
+  desktop.Sample(samp,blueUv).b);
+}
 float4 PSMain(V i):SV_TARGET {
  float2 px=i.uv*windowSize, local=px-padding, p=local-lensSize*.5;
  float mouseLength=length(mouseOffset);
  float2 mouseDirection=mouseOffset/max(mouseLength,.001);
- float stretch=min(mouseLength/max(lensSize.x,.001),1)*controlSettings.z;
+ float2 mouseOutside=max(abs(mouseOffset)-lensSize*.5,0);
+ float mouseFade=saturate(1-length(mouseOutside)/max(200*controlSettings.y,.001));
+ float stretch=min(mouseLength/max(300*controlSettings.y,.001),1)*controlSettings.z*mouseFade;
  float2 shapeScale=float2(
-  1+abs(mouseDirection.x)*stretch*.18-abs(mouseDirection.y)*stretch*.08,
-  1+abs(mouseDirection.y)*stretch*.18-abs(mouseDirection.x)*stretch*.08);
+  1+abs(mouseDirection.x)*stretch*.3-abs(mouseDirection.y)*stretch*.15,
+  1+abs(mouseDirection.y)*stretch*.3-abs(mouseDirection.x)*stretch*.15);
  float2 shapeP=p/shapeScale;
  float radius=min(lensSize.y*.5,controlSettings.w);
  float d=sdf(shapeP,lensSize*.5,radius); float sd=sdf(shapeP-float2(0,shadowSettings.x),lensSize*.5,radius);
- float shadow=exp(-pow(max(sd,0)/shadowSettings.y,2))*shadowSettings.z;
+ float shadow=gaussianTail(sd,shadowSettings.y*.5)*shadowSettings.z;
  float2 uv=local/lensSize, center=uv-.5;
- float mapDistance=sdf(center,refractionSettings.xy,refractionSettings.z);
- float displacement=smoothstep(refractionSettings.w,0,mapDistance-effectsSettings.x);
- float scaled=smoothstep(0,1,displacement);
- float mode=interactionPadding.y;
- if(mode>.5 && mode<1.5) scaled=pow(scaled,.72);
- else if(mode>=1.5 && mode<2.5) scaled=pow(scaled,1.55);
- else if(mode>=2.5) scaled=saturate(scaled+sin(atan2(center.y,center.x)*6)*displacement*.045);
- float2 source=(center*scaled+.5)*lensSize;
- float2 screenUv=(windowOrigin+padding+source-outputOrigin)/outputSize, texel=1/outputSize;
- float edge=saturate(1-smoothstep(0,effectsSettings.y,-d));
- float2 radial=normalize(center+float2(.0001,.0001));
- float3 col=desktop.Sample(samp,screenUv).rgb;
- float chroma=edge*edge*effectsSettings.z;
- col.r=desktop.Sample(samp,screenUv+radial*texel*chroma).r;
- col.b=desktop.Sample(samp,screenUv-radial*texel*chroma).b;
+ float2 encodedOffset=sampleProceduralMap(
+  local,lensSize,controlSettings.y,colorSettings.z/controlSettings.y);
+ bool proceduralMode=interactionPadding.y>=2.5;
+ float mapAspect=lensSize.x/max(lensSize.y,.001);
+ float2 mapUv=uv;
+ if(mapAspect>=1) mapUv.y=(uv.y-.5)/mapAspect+.5;
+ else mapUv.x=(uv.x-.5)*mapAspect+.5;
+ float4 mapSample=displacementMap.Sample(samp,mapUv);
+ float2 staticOffset=float2(mapSample.r,mapSample.b)-.5;
+ float2 offsetPx=(proceduralMode ? encodedOffset : staticOffset)*effectsSettings.y;
+ float2 baseScreenUv=(windowOrigin+padding+local-outputOrigin)/outputSize, texel=1/outputSize;
+ float2 sourceMinimum=(windowOrigin+padding-outputOrigin)/outputSize;
+ float2 sourceMaximum=(windowOrigin+padding+lensSize-outputOrigin)/outputSize;
+ float postSigma=effectsSettings.w;
+ float neighborWeight=exp(-.5/max(postSigma*postSigma,.0001));
+ float diagonalWeight=neighborWeight*neighborWeight;
+ float weightSum=1+neighborWeight*4+diagonalWeight*4;
+ float baseScale=proceduralMode ? 1 : -1;
+ float3 col=sampleChromatic(baseScreenUv,offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum);
+ col+=sampleChromatic(baseScreenUv+float2(texel.x,0),offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*neighborWeight;
+ col+=sampleChromatic(baseScreenUv-float2(texel.x,0),offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*neighborWeight;
+ col+=sampleChromatic(baseScreenUv+float2(0,texel.y),offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*neighborWeight;
+ col+=sampleChromatic(baseScreenUv-float2(0,texel.y),offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*neighborWeight;
+ col+=sampleChromatic(baseScreenUv+texel,offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*diagonalWeight;
+ col+=sampleChromatic(baseScreenUv-texel,offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*diagonalWeight;
+ col+=sampleChromatic(baseScreenUv+float2(texel.x,-texel.y),offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*diagonalWeight;
+ col+=sampleChromatic(baseScreenUv+float2(-texel.x,texel.y),offsetPx,texel,effectsSettings.z,baseScale,sourceMinimum,sourceMaximum)*diagonalWeight;
+ col/=weightSum;
  if(interactionPadding.x>.5) {
-  col=col/(1+max(col-1,0));
-  col=pow(saturate(col),1/2.2);
+  col=saturate(cssSaturate(linearToSrgb(col),colorSettings.x));
  }
- float luminance=dot(col,float3(.2126,.7152,.0722));
- col=lerp(luminance.xxx,col,controlSettings.y);
- col=saturate((col-.5)*effectsSettings.w+.5); col=saturate(col*colorSettings.x+colorSettings.y);
- float2 lightDirection=normalize(mouseOffset+float2(0,-.0001));
- float2 edgeNormal=normalize(float2(center.x/lensSize.x,center.y/lensSize.y)+float2(.0001,.0001));
- float directionalLight=edge*saturate(dot(edgeNormal,lightDirection)) * colorSettings.w;
- float directionalShadow=edge*saturate(dot(edgeNormal,-lightDirection)) * detailSettings.y;
- col=saturate(col+directionalLight-directionalShadow);
+ float2 normal=float2(
+  sdf(shapeP+float2(1,0),lensSize*.5,radius)-sdf(shapeP-float2(1,0),lensSize*.5,radius),
+  sdf(shapeP+float2(0,1),lensSize*.5,radius)-sdf(shapeP-float2(0,1),lensSize*.5,radius));
+ normal=normalize(normal+float2(.0001,.0001));
+ float2 normalizedMouse=float2(mouseOffset.x/max(lensSize.x,1),mouseOffset.y/max(lensSize.y,1))*100;
+ float angle=radians(135+normalizedMouse.x*1.2);
+ float2 gradientDirection=float2(sin(angle),-cos(angle));
+ float gradientExtent=max(dot(abs(gradientDirection),lensSize*.5),.0001);
+ float gradientPosition=dot(local-lensSize*.5,gradientDirection)/(gradientExtent*2)+.5;
+ float stopA=clamp((33+normalizedMouse.y*.3)/100,.1,.9);
+ float stopB=clamp((66+normalizedMouse.y*.4)/100,.1,.9);
+ float insideDistance=max(-d,0);
+ float borderWidth=1.5*controlSettings.y;
+ float borderMask=saturate(1-smoothstep(0,borderWidth,insideDistance));
+ float insetDirection=saturate(.5-normal.y*.5);
+ float insetGlow=exp(-.5*pow(insideDistance/max(borderWidth,.001),2))*insetDirection*.25;
+ float insetAlpha=saturate((1-smoothstep(.25*controlSettings.y,.75*controlSettings.y,insideDistance))*.5+insetGlow)*borderMask;
+ float screenAlpha=saturate(gradientAlpha(
+  gradientPosition,stopA,stopB,
+  .12+abs(normalizedMouse.x)*.008,
+  .4+abs(normalizedMouse.x)*.012))*borderMask*.2;
+ screenAlpha=1-(1-screenAlpha)*(1-insetAlpha*.2);
+ col=1-(1-col)*(1-screenAlpha);
+ float overlayAlpha=saturate(gradientAlpha(
+  gradientPosition,stopA,stopB,
+  .32+abs(normalizedMouse.x)*.008,
+  .6+abs(normalizedMouse.x)*.012))*borderMask;
+ overlayAlpha=1-(1-overlayAlpha)*(1-insetAlpha);
+ col=lerp(col,overlayWhite(col),overlayAlpha);
  float aa=max(fwidth(d)*detailSettings.z,detailSettings.w);
  float glassAlpha=smoothstep(aa,-aa,d);
  float alpha=glassAlpha+shadow*(1-glassAlpha);
@@ -257,6 +383,21 @@ struct Renderer {
     style: EffectStyle,
     light_direction: [f32; 2],
     freeze_capture: bool,
+    displacement_maps: [EmbeddedMap; 3],
+}
+
+#[allow(dead_code)]
+struct EmbeddedMap {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    view: ID3D11ShaderResourceView,
+}
+
+struct DecodedMap {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
 struct OutputCapture {
@@ -292,6 +433,69 @@ fn compile(entry: windows::core::PCSTR, target: windows::core::PCSTR) -> Result<
     }
 }
 
+unsafe fn decode_embedded_map(factory: &IWICImagingFactory, encoded: &[u8]) -> Result<DecodedMap> {
+    let stream = factory.CreateStream()?;
+    stream.InitializeFromMemory(encoded)?;
+    let decoder =
+        factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnLoad)?;
+    let frame = decoder.GetFrame(0)?;
+    let converter = factory.CreateFormatConverter()?;
+    converter.Initialize(
+        &frame,
+        &GUID_WICPixelFormat32bppBGRA,
+        WICBitmapDitherTypeNone,
+        None::<&IWICPalette>,
+        0.0,
+        WICBitmapPaletteTypeCustom,
+    )?;
+    let source: IWICBitmapSource = converter.cast()?;
+    let mut width = 0;
+    let mut height = 0;
+    source.GetSize(&mut width, &mut height)?;
+    let stride = width
+        .checked_mul(4)
+        .ok_or_else(windows::core::Error::from_thread)?;
+    let mut pixels = vec![0; stride as usize * height as usize];
+    source.CopyPixels(std::ptr::null(), stride, &mut pixels)?;
+    Ok(DecodedMap {
+        pixels,
+        width,
+        height,
+    })
+}
+
+unsafe fn upload_embedded_map(device: &ID3D11Device, decoded: DecodedMap) -> Result<EmbeddedMap> {
+    let description = D3D11_TEXTURE2D_DESC {
+        Width: decoded.width,
+        Height: decoded.height,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        ..Default::default()
+    };
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: decoded.pixels.as_ptr().cast(),
+        SysMemPitch: decoded.width * 4,
+        ..Default::default()
+    };
+    let mut texture = None;
+    device.CreateTexture2D(&description, Some(&initial), Some(&mut texture))?;
+    let mut view = None;
+    device.CreateShaderResourceView(&texture.unwrap(), None, Some(&mut view))?;
+    Ok(EmbeddedMap {
+        pixels: decoded.pixels,
+        width: decoded.width,
+        height: decoded.height,
+        view: view.unwrap(),
+    })
+}
+
 impl Renderer {
     fn has_desktop_frame(&self) -> bool {
         self.outputs
@@ -300,6 +504,13 @@ impl Renderer {
     }
 
     unsafe fn new(hwnd: HWND, width: i32, height: i32, preset: Preset) -> Result<Self> {
+        let wic: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
+        let decoded_maps = [
+            decode_embedded_map(&wic, STANDARD_MAP)?,
+            decode_embedded_map(&wic, POLAR_MAP)?,
+            decode_embedded_map(&wic, PROMINENT_MAP)?,
+        ];
         let swap_desc = DXGI_SWAP_CHAIN_DESC {
             BufferDesc: DXGI_MODE_DESC {
                 Width: width as u32,
@@ -346,6 +557,12 @@ impl Renderer {
         let dxgi_device: IDXGIDevice = device.cast()?;
         let d2d_device = D2D1CreateDevice(&dxgi_device, None)?;
         let d2d_context = d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+        let [standard, polar, prominent] = decoded_maps;
+        let displacement_maps = [
+            upload_embedded_map(&device, standard)?,
+            upload_embedded_map(&device, polar)?,
+            upload_embedded_map(&device, prominent)?,
+        ];
         let back: ID3D11Texture2D = swap_chain.GetBuffer(0)?;
         let mut target = None;
         device.CreateRenderTargetView(&back, None, Some(&mut target))?;
@@ -405,6 +622,7 @@ impl Renderer {
             style: preset.style(),
             light_direction: [0.0, -1.0],
             freeze_capture: false,
+            displacement_maps,
         };
         renderer.create_duplications()?;
         Ok(renderer)
@@ -552,6 +770,11 @@ impl Renderer {
         };
         let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
         source_texture.GetDesc(&mut texture_desc);
+        let saturation = if texture_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+            1.0
+        } else {
+            saturation
+        };
         let pixel_format = D2D1_PIXEL_FORMAT {
             format: texture_desc.Format,
             alphaMode: D2D1_ALPHA_MODE_IGNORE,
@@ -588,10 +811,69 @@ impl Renderer {
         else {
             return;
         };
+        let crop_rect = D2D_RECT_F {
+            left: (LENS_POSITION.x - output.rect.left).max(0) as f32,
+            top: (LENS_POSITION.y - output.rect.top).max(0) as f32,
+            right: (LENS_POSITION.x + LENS_SIZE.x - output.rect.left).min(texture_desc.Width as i32)
+                as f32,
+            bottom: (LENS_POSITION.y + _visual_height - output.rect.top)
+                .min(texture_desc.Height as i32) as f32,
+        };
+        if crop_rect.right <= crop_rect.left || crop_rect.bottom <= crop_rect.top {
+            return;
+        }
+        let Ok(crop) = self.d2d_context.CreateEffect(&CLSID_D2D1Crop) else {
+            return;
+        };
+        crop.SetInput(0, &source_bitmap, true);
+        let crop_bytes = slice::from_raw_parts(
+            (&crop_rect as *const D2D_RECT_F).cast::<u8>(),
+            size_of::<D2D_RECT_F>(),
+        );
+        if crop
+            .SetValue(
+                D2D1_CROP_PROP_RECT.0 as u32,
+                D2D1_PROPERTY_TYPE_VECTOR4,
+                crop_bytes,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let Ok(cropped) = crop.GetOutput() else {
+            return;
+        };
+        let Ok(border) = self.d2d_context.CreateEffect(&CLSID_D2D1Border) else {
+            return;
+        };
+        border.SetInput(0, &cropped, true);
+        let edge_mode = D2D1_BORDER_EDGE_MODE_MIRROR.0;
+        let edge_bytes =
+            slice::from_raw_parts((&edge_mode as *const i32).cast::<u8>(), size_of::<i32>());
+        if border
+            .SetValue(
+                D2D1_BORDER_PROP_EDGE_MODE_X.0 as u32,
+                D2D1_PROPERTY_TYPE_ENUM,
+                edge_bytes,
+            )
+            .is_err()
+            || border
+                .SetValue(
+                    D2D1_BORDER_PROP_EDGE_MODE_Y.0 as u32,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    edge_bytes,
+                )
+                .is_err()
+        {
+            return;
+        }
+        let Ok(bordered) = border.GetOutput() else {
+            return;
+        };
         let Ok(blur) = self.d2d_context.CreateEffect(&CLSID_D2D1GaussianBlur) else {
             return;
         };
-        blur.SetInput(0, &source_bitmap, true);
+        blur.SetInput(0, &bordered, true);
         let sigma_bytes = slice::from_raw_parts((&sigma as *const f32).cast::<u8>(), 4);
         if blur
             .SetValue(
@@ -606,15 +888,44 @@ impl Renderer {
         let Ok(blurred_image) = blur.GetOutput() else {
             return;
         };
-        let Ok(saturate_effect) = self.d2d_context.CreateEffect(&CLSID_D2D1Saturation) else {
+        let Ok(saturate_effect) = self.d2d_context.CreateEffect(&CLSID_D2D1ColorMatrix) else {
             return;
         };
         saturate_effect.SetInput(0, &blurred_image, true);
-        let saturation_bytes = slice::from_raw_parts((&saturation as *const f32).cast::<u8>(), 4);
+        let matrix = D2D_MATRIX_5X4_F {
+            Anonymous: windows::Win32::Graphics::Direct2D::Common::D2D_MATRIX_5X4_F_0 {
+                m: [
+                    0.213 + 0.787 * saturation,
+                    0.213 - 0.213 * saturation,
+                    0.213 - 0.213 * saturation,
+                    0.0,
+                    0.715 - 0.715 * saturation,
+                    0.715 + 0.285 * saturation,
+                    0.715 - 0.715 * saturation,
+                    0.0,
+                    0.072 - 0.072 * saturation,
+                    0.072 - 0.072 * saturation,
+                    0.072 + 0.928 * saturation,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+            },
+        };
+        let saturation_bytes = slice::from_raw_parts(
+            (&matrix as *const D2D_MATRIX_5X4_F).cast::<u8>(),
+            size_of::<D2D_MATRIX_5X4_F>(),
+        );
         if saturate_effect
             .SetValue(
-                D2D1_SATURATION_PROP_SATURATION.0 as u32,
-                D2D1_PROPERTY_TYPE_FLOAT,
+                D2D1_COLORMATRIX_PROP_COLOR_MATRIX.0 as u32,
+                D2D1_PROPERTY_TYPE_MATRIX_5X4,
                 saturation_bytes,
             )
             .is_err()
@@ -641,6 +952,7 @@ impl Renderer {
     unsafe fn refract_output(
         &self,
         output: &OutputCapture,
+        map: &EmbeddedMap,
         scale: f32,
         aberration: f32,
         post_blur: f32,
@@ -691,14 +1003,6 @@ impl Renderer {
             return;
         };
 
-        // This legacy path is retained for the live controls, but the main renderer no longer
-        // depends on an external displacement-map asset.
-        let mut map_pixels = vec![0u8; 256 * 256 * 4];
-        for (index, pixel) in map_pixels.chunks_exact_mut(4).enumerate() {
-            let x = index % 256;
-            let y = index / 256;
-            pixel.copy_from_slice(&[y as u8, 128, x as u8, 255]);
-        }
         let map_properties = D2D1_BITMAP_PROPERTIES1 {
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -711,11 +1015,11 @@ impl Renderer {
         };
         let Ok(map_source) = self.d2d_context.CreateBitmap(
             D2D_SIZE_U {
-                width: 256,
-                height: 256,
+                width: map.width,
+                height: map.height,
             },
-            Some(map_pixels.as_ptr().cast()),
-            256 * 4,
+            Some(map.pixels.as_ptr().cast()),
+            map.width * 4,
             &map_properties,
         ) else {
             return;
@@ -738,20 +1042,20 @@ impl Renderer {
         };
         let destination_aspect = LENS_SIZE.x as f32 / visual_height.max(1) as f32;
         let source_rect = if destination_aspect >= 1.0 {
-            let height = 256.0 / destination_aspect;
+            let height = map.height as f32 / destination_aspect;
             D2D_RECT_F {
                 left: 0.0,
-                top: (256.0 - height) * 0.5,
-                right: 256.0,
-                bottom: (256.0 + height) * 0.5,
+                top: (map.height as f32 - height) * 0.5,
+                right: map.width as f32,
+                bottom: (map.height as f32 + height) * 0.5,
             }
         } else {
-            let width = 256.0 * destination_aspect;
+            let width = map.width as f32 * destination_aspect;
             D2D_RECT_F {
-                left: (256.0 - width) * 0.5,
+                left: (map.width as f32 - width) * 0.5,
                 top: 0.0,
-                right: (256.0 + width) * 0.5,
-                bottom: 256.0,
+                right: (map.width as f32 + width) * 0.5,
+                bottom: map.height as f32,
             }
         };
         self.d2d_context.DrawBitmap(
@@ -903,12 +1207,16 @@ impl Renderer {
                 Self::capture_output(&self.device, &self.context, output);
             }
         }
-        if style.blur_amount > 0.001 {
-            let blur_sigma = scale_effect_for_dpi(style.blur_amount * 24.0, LENS_DPI);
-            for output in &self.outputs {
-                self.blur_output(output, blur_sigma, 1.0, visual_height);
-            }
+        let blur_sigma = scale_effect_for_dpi(
+            (if style.over_light { 12.0 } else { 4.0 }) + style.blur_amount * 32.0,
+            LENS_DPI,
+        );
+        for output in &self.outputs {
+            self.blur_output(output, blur_sigma, style.saturation, visual_height);
         }
+        let mode = style.refraction_mode.round().clamp(0.0, 3.0) as usize;
+        let displacement_scale =
+            style.displacement_scale * if style.over_light { 0.5 } else { 1.0 };
         let mut window = RECT::default();
         if GetWindowRect(hwnd, &mut window).is_err() {
             return;
@@ -946,14 +1254,10 @@ impl Renderer {
         self.context
             .PSSetSamplers(0, Some(&[Some(self.sampler.clone())]));
         for output in &self.outputs {
-            let view = if style.blur_amount > 0.001 {
-                output.blurred_view.clone()
-            } else {
-                output.desktop_view.clone()
-            };
-            let Some(view) = view else {
+            let Some(view) = output.blurred_view.clone() else {
                 continue;
             };
+            let map_view = &self.displacement_maps[mode.min(2)].view;
             let constants = Constants {
                 output_origin: [output.rect.left as f32, output.rect.top as f32],
                 output_size: [
@@ -968,22 +1272,22 @@ impl Renderer {
                     (LENS_POSITION.y - window.top) as f32,
                 ],
                 shadow_settings: [
-                    scale_effect_for_dpi(7.0, LENS_DPI),
-                    scale_effect_for_dpi(9.0, LENS_DPI),
-                    if style.over_light { 0.42 } else { 0.28 },
+                    scale_effect_for_dpi(if style.over_light { 16.0 } else { 12.0 }, LENS_DPI),
+                    scale_effect_for_dpi(if style.over_light { 70.0 } else { 40.0 }, LENS_DPI),
+                    if style.over_light { 0.75 } else { 0.25 },
                     0.0,
                 ],
                 refraction_settings: [0.30, 0.20, 0.60, 0.80],
                 effects_settings: [
-                    0.15 * (style.displacement_scale / 100.0).clamp(0.0, 2.0),
-                    scale_effect_for_dpi(24.0, LENS_DPI),
-                    scale_effect_for_dpi(style.chromatic_offset, LENS_DPI),
-                    1.04,
+                    0.15,
+                    scale_effect_for_dpi(displacement_scale, LENS_DPI),
+                    style.chromatic_offset,
+                    scale_effect_for_dpi((0.5 - style.chromatic_offset * 0.1).max(0.1), LENS_DPI),
                 ],
                 color_settings: [
-                    if style.over_light { 0.86 } else { 1.025 },
+                    style.saturation,
                     if style.over_light { 0.0 } else { 0.018 },
-                    0.50,
+                    LENS_SIZE.x as f32 * 0.324_668_2,
                     0.07,
                 ],
                 detail_settings: [
@@ -993,8 +1297,8 @@ impl Renderer {
                     scale_effect_for_dpi(AA_MIN_HALF_WIDTH, LENS_DPI),
                 ],
                 control_settings: [
-                    0.0,
-                    style.saturation,
+                    if style.over_light { 1.0 } else { 0.0 },
+                    LENS_DPI as f32 / 96.0,
                     style.elasticity,
                     scale_effect_for_dpi(style.corner_radius.min(LENS_H as f32 * 0.5), LENS_DPI),
                 ],
@@ -1045,9 +1349,10 @@ impl Renderer {
                     .min(output.rect.bottom - window.top)
                     .min(self.height),
             }]));
-            self.context.PSSetShaderResources(0, Some(&[Some(view)]));
+            self.context
+                .PSSetShaderResources(0, Some(&[Some(view), Some(map_view.clone())]));
             self.context.Draw(3, 0);
-            self.context.PSSetShaderResources(0, Some(&[None]));
+            self.context.PSSetShaderResources(0, Some(&[None, None]));
         }
         let _ = self.swap_chain.Present(1, DXGI_PRESENT(0));
     }
@@ -1196,6 +1501,7 @@ pub fn run(preset: Preset) -> Result<()> {
     unsafe {
         LIVE_STYLE = Some(preset.style());
         let screenshot_mode = std::env::var_os("LIQUID_GLASS_SCREENSHOT").is_some();
+        CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
         let module = GetModuleHandleW(None)?;
         let name = w!("RustLiquidGlassD3D11");

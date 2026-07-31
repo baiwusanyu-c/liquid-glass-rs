@@ -14,7 +14,7 @@
 - `frosted_liquid` 示例支持 HDR/scRGB 桌面捕获的色调映射
 - 基于 SDF 像素导数的轮廓抗锯齿
 - 捕获排除，透镜窗口不会递归出现在自己的画面中
-- 所有常用视觉参数集中在 Rust 源文件顶部
+- `frosted_liquid` 的常用视觉参数可通过常驻控制器实时调整
 
 ## 环境要求
 
@@ -45,8 +45,9 @@ cargo run
 cargo run --example frosted_liquid
 ```
 
-该示例复用默认程序的桌面折射基础，并增加 Direct2D Gaussian Blur、可调饱和度、RGB
-色散、鼠标方向边缘高光和弹性形变。示例窗口固定为 96 DPI 下的 `352 x 236` 逻辑像素，
+该示例使用 DXGI Desktop Duplication 捕获桌面，通过 Direct2D 完成裁剪、镜像边缘扩展、
+Gaussian Blur 和饱和度处理，再由 D3D11 像素着色器完成位移折射、RGB 色散、边缘高光、
+阴影和弹性形变。示例窗口固定为 96 DPI 下的 `352 x 236` 逻辑像素，
 只显示始终展开的参数控制器；顶部空白区域用于拖动窗口。
 
 控制器参数会实时作用于渲染：
@@ -62,6 +63,15 @@ cargo run --example frosted_liquid
 
 默认值为：Displacement `100`、Blur `0.5`、Saturation `140%`、Chromatic
 Aberration `2`、Elasticity `0.00`、Corner Radius `32px`。
+
+### 折射模式
+
+- `Standard`、`Polar`、`Prominent` 使用 React 实现中原始 Base64 位移图的逐字节解码结果。
+- 三张位移图以二进制资源编译进可执行文件，启动时通过 Windows Imaging Component 解码一次并上传 GPU。
+- `Shader` 不使用静态位移图，位移场由 HLSL 按 React Canvas shader 的 SDF、归一化、2px 边缘衰减和 8-bit 量化规则生成。
+- 四种模式均使用 R 通道作为 X 位移、B 通道作为 Y 位移，并分别计算 RGB 三路色差采样。
+- backdrop blur 输入和折射采样在卡片边界使用镜像延展。该行为通过 React/Chromium 坐标编码与颜色坡度探针验证，可防止卡片外内容混入边缘。
+- 不需要运行时外部图片、`examples/frosted_liquid/assets` 目录或额外第三方图像依赖。
 
 构建发布版本：
 
@@ -150,7 +160,11 @@ liquid-glass/
     |-- frosted_liquid.rs            # 示例入口
     `-- frosted_liquid/
         |-- app.rs                   # 捕获、D2D/D3D11 渲染和交互
-        `-- demo_ui.rs               # 自绘参数控制器
+        |-- demo_ui.rs               # 自绘参数控制器
+        `-- embedded/                # 编译进可执行文件的 React 原始位移图
+            |-- standard.jpg
+            |-- polar.jpg
+            `-- prominent.png
 ```
 
 ## 实现概要
@@ -160,8 +174,10 @@ liquid-glass/
 时分别绘制相交区域。D3D11 像素着色器使用有符号距离场计算轮廓，并完成折射和透明度合成。
 
 `frosted_liquid` 另外创建控制器的可视窗口和透明点击窗口。两者在拖动和
-`WM_DPICHANGED` 时同步位置与尺寸；背景模糊由 Direct2D Gaussian Blur 完成，折射、色差、
-轮廓和鼠标高光由 D3D11 像素着色器完成。
+`WM_DPICHANGED` 时同步位置与尺寸。Direct2D 先将捕获内容裁剪到卡片区域，通过 MIRROR
+边界扩展后执行 Gaussian Blur 和饱和度处理；D3D11 像素着色器随后读取静态或程序化位移场，
+对越界坐标执行相同的 MIRROR 映射，并完成 RGB 色差、轮廓和鼠标高光。
+静态位移图由 WIC 从可执行文件内嵌字节解码，不访问运行时外部资源。
 
 多显示器坐标统一使用 Windows 虚拟桌面坐标，因此位于主屏左侧或上方的显示器所产生
 的负坐标也能正确处理。
